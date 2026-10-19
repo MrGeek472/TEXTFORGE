@@ -1,0 +1,182 @@
+🔒 LICENCE D'UTILISATION DU LOGICIEL
+Licence d'Utilisation Non Commerciale – LUNC v1.1
+
+1. Qui est propriétaire du logiciel
+
+Ce logiciel est ma création.
+Il est protégé par le droit français sur le droit d'auteur.
+
+👉 Je reste le seul propriétaire du code.
+Cette licence ne vend pas le logiciel, elle autorise seulement certains usages.
+
+
+
+2. Ce que cette licence t'autorise à faire
+
+
+Tu as le droit d'utiliser le logiciel uniquement pour :
+
+un usage personnel et privé
+
+un usage éducatif (apprendre, étudier, tester)
+
+de la recherche ou de l'expérimentation
+
+des tests techniques sans but économique
+
+👉 Si ce n'est pas dans cette liste, ce n'est pas autorisé.
+
+
+
+3. Ce que tu n'as PAS le droit de faire
+
+
+Sans mon autorisation écrite, tu n'as pas le droit de :
+
+vendre le logiciel
+
+le louer, le donner ou le distribuer à d'autres
+
+gagner de l'argent avec (directement ou indirectement)
+
+l'utiliser dans un cadre professionnel ou commercial
+
+l'intégrer dans un produit, un service ou une plateforme
+
+l'utiliser comme base d'un service en ligne (SaaS, API, bot payant, etc.)
+
+t'en servir pour faire de la pub, une démo commerciale ou du marketing
+
+👉 Dès qu'il y a un avantage économique identifiable, c'est interdit.
+
+
+
+4. Modifications du logiciel
+
+
+Tu as le droit de modifier le logiciel pour toi, tant que :
+
+c'est non commercial
+
+tu ne le distribues pas
+
+tu ne le vends pas
+
+Si tu modifies le code :
+
+c'est sous ta responsabilité, pas la mienne
+
+je ne suis responsable d'aucun problème lié à ta modification
+
+
+
+5. Droits impératifs de l'utilisateur
+
+
+Conformément à l'article L122-6-1 II du Code de la propriété intellectuelle :
+
+tu as le droit d'effectuer une copie de sauvegarde si elle est nécessaire pour préserver l'utilisation du logiciel
+
+tu as le droit d'observer, d'étudier ou de tester le fonctionnement du logiciel pour en comprendre les principes
+
+👉 Ces droits s'appliquent même sans mon autorisation.
+👉 Tout autre acte (reproduction, adaptation, distribution) requiert mon autorisation écrite.
+
+
+
+6. Le logiciel est fourni "tel quel"
+
+
+Le logiciel est fourni en l'état, sans garantie d'aucune sorte, expresse ou implicite.
+
+👉 Ça veut dire :
+
+je ne garantis pas qu'il fonctionne toujours
+
+je ne garantis pas qu'il est sans bug
+
+je ne garantis pas qu'il est adapté à ton usage
+
+je ne garantis pas qu'il est sécurisé
+
+👉 Tu l'utilises à tes risques.
+
+
+
+7. Responsabilité : ce que je n'assume PAS
+
+
+Dans les limites prévues par le droit français, et dans la mesure où cette exonération ne prive pas le contrat de son objet essentiel :
+
+je ne suis pas responsable des pertes d'argent
+
+je ne suis pas responsable des pertes de données
+
+je ne suis pas responsable des dommages indirects
+
+je ne suis pas responsable de ce que des tiers font avec
+
+👉 Si quelqu'un utilise ce logiciel pour faire n'importe quoi,
+👉 ce n'est pas moi qui en réponds.
+
+⚠️ Exception légale :
+Cette exonération ne s'applique pas en cas de faute lourde ou dolosive de ma part.
+Si je fais volontairement quelque chose de grave ou illégal, la loi s'applique (et aucune licence ne peut l'empêcher).
+
+
+
+8. Acceptation de la licence
+
+
+Tout téléchargement, installation ou exécution du logiciel, même partiel, vaut acceptation expresse et préalable des termes de la présente licence.
+
+👉 Si tu n'acceptes pas ces termes, tu n'as pas le droit de télécharger, d'installer ou d'utiliser ce logiciel.
+
+
+
+9. Si quelqu'un enfreint la licence
+
+
+Si quelqu'un ne respecte pas cette licence :
+
+il perd immédiatement le droit d'utiliser le logiciel
+
+il doit arrêter de l'utiliser
+
+il doit supprimer toutes les copies
+
+👉 Toute utilisation après ça devient illégale.
+
+
+
+10. Pas d'autorisation implicite
+
+
+Le fait que je ne réagisse pas tout de suite
+ne veut pas dire que j'autorise quoi que ce soit.
+
+👉 Le silence n'est pas un accord.
+
+
+
+11. Preuves
+
+Les éléments techniques (dépôts, dates, historiques, journaux)
+peuvent servir de preuves, sans empêcher une contestation légitime.
+
+
+
+12. Loi applicable
+
+Cette licence est régie par le droit français.
+
+En cas de litige, ce sont les tribunaux français qui sont compétents, selon les règles légales obligatoires.
+
+
+
+13. Cas particuliers
+
+Si tu veux faire quelque chose qui n'est pas autorisé ici
+(utilisation pro, commerciale, partenariat, etc.) :
+
+👉 Tu dois me demander une autorisation écrite.
