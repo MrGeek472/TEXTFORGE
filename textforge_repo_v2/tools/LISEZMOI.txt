@@ -1,9 +1,0 @@
-Outils externes facultatifs de TEXFORGE
-=======================================
-
-texconv.exe (DirectXTex, Microsoft) — compression DDS de référence (BC1/BC2/BC3, BC7 pour Direct3D 11)
-  Téléchargement : https://github.com/microsoft/DirectXTex/releases  (fichier texconv.exe)
-  Pose-le dans ce dossier : TEXFORGE détecte tools\texconv.exe automatiquement.
-  Sans lui, l'encodeur intégré (DXT1/DXT3/DXT5) est utilisé.
-
-Vérification : texforge.bat doctor
