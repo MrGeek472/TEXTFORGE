@@ -1,0 +1,8 @@
+numpy>=1.24
+Pillow>=12.0
+aiohttp>=3.9
+tqdm>=4.66
+# Interface graphique (app_gui.py) ; « PySide6 » complet convient aussi
+PySide6-Essentials>=6.6
+# Optionnel : fournisseur cloud Higgsfield (provider.name = "higgsfield")
+# higgsfield-client>=0.2.0
