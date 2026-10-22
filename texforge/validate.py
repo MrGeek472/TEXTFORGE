@@ -17,6 +17,7 @@ from __future__ import annotations
 import numpy as np
 from PIL import Image
 
+from .i18n import tr
 from .imaging import (LANCZOS, Analysis, _wrap_resize, bleed_rgb, box_blur, luminance, to_f32,
                       wrap_seam_ratio)
 
@@ -97,19 +98,25 @@ def _local_worst(la: np.ndarray, lb: np.ndarray, ref_rgb: np.ndarray, gen_rgb: n
     return worst_ncc, worst_col
 
 
+def _comparable(img: Image.Image, an: Analysis) -> Image.Image:
+    """Image comparable après réduction : fond étendu sous une transparence réelle ; sinon couleurs
+    seules (l'alpha d'une normal map DXT5nm est une donnée, que Pillow prémultiplierait)."""
+    return bleed_rgb(img) if an.cutout else img.convert("RGB").convert("RGBA")
+
+
 def evaluate(src: Image.Image, result: Image.Image, an: Analysis, cfg: dict) -> dict:
     q = cfg["quality"]
-    base = bleed_rgb(src) if an.alpha_class != "none" else src.convert("RGBA")
+    base = _comparable(src, an)
     # Même traitement des zones transparentes des deux côtés : sinon Pillow réduit le résultat
     # RGBA en alpha prémultiplié (fond noir) face à un original au fond étendu, et une découpe
     # peu couvrante (feuillage, grillage) paraît décalée ou réinventée.
-    res_base = bleed_rgb(result) if an.alpha_class != "none" else result.convert("RGBA")
+    res_base = _comparable(result, an)
 
     def prepare(long_side: int):
         cw, ch = _compare_size(src.width, src.height, long_side)
         ref = to_f32(base.resize((cw, ch), LANCZOS))
         gen = to_f32(res_base.resize((cw, ch), LANCZOS))
-        if an.alpha_class != "none":
+        if an.cutout:
             mask = to_f32(src.resize((cw, ch), LANCZOS))[..., 3] > 0.5
         else:
             mask = np.ones((ch, cw), bool)
@@ -163,15 +170,15 @@ def evaluate(src: Image.Image, result: Image.Image, an: Analysis, cfg: dict) -> 
     reasons = []
     min_struct = float(q.get("min_structure", 0.65))
     if structure < min_struct:
-        reasons.append(f"structure {structure:.2f} < {min_struct}")
+        reasons.append(tr("structure {structure:.2f} < {lim}", structure=structure, lim=min_struct))
     if not low_contrast and shift > float(q.get("max_shift", 0.03)):
-        reasons.append(f"décalage {shift:.3f} > {q.get('max_shift', 0.03)}")
+        reasons.append(tr("décalage {shift:.3f} > {lim}", shift=shift, lim=q.get("max_shift", 0.03)))
     if not low_contrast and worst_ncc < float(q.get("min_local", 0.3)):
-        reasons.append(f"zone modifiée (corrélation locale {worst_ncc:.2f})")
+        reasons.append(tr("zone modifiée (corrélation locale {v:.2f})", v=worst_ncc))
     if worst_col > float(q.get("max_local_color", 0.12)):
-        reasons.append(f"couleur locale changée ({worst_col * 255:.0f}/255)")
+        reasons.append(tr("couleur locale changée ({v:.0f}/255)", v=worst_col * 255))
     if seam_max is not None and seam_max > seam_limit:
-        reasons.append(f"raccord {seam_max:.2f} > {seam_limit:.2f}")
+        reasons.append(tr("raccord {v:.2f} > {lim:.2f}", v=seam_max, lim=seam_limit))
 
     score = (structure - 4.0 * shift + 0.3 * min(worst_ncc, 1.0) - 1.0 * worst_col
              - 0.1 * max(0.0, (seam_max or 0) - (seam_limit or 0)))

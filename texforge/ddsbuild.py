@@ -28,6 +28,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
+from .i18n import tr
 from . import dds
 from .imaging import Analysis, bleed_rgb
 from .metrics import linear_to_srgb, resize_f32, srgb_to_linear
@@ -35,7 +36,7 @@ from .metrics import linear_to_srgb, resize_f32, srgb_to_linear
 LANCZOS = Image.Resampling.LANCZOS
 BOX = Image.Resampling.BOX
 TEXCONV_FORMAT = {"DXT1": "BC1_UNORM", "DXT3": "BC2_UNORM", "DXT5": "BC3_UNORM", "BC7": "BC7_UNORM"}
-DATA_FORMATS = {"L8", "A8", "A8L8"}
+DATA_FORMATS = {"L8", "A8", "A8L8", "BC4", "BC5"}
 
 
 # ------------------------------------------------------------------ plan
@@ -48,7 +49,7 @@ class DDSPlan:
     width: int
     height: int
     color_space: str             # srgb | linear | normal
-    alpha_mode: str              # none | test (découpe) | blend (dégradé)
+    alpha_mode: str              # none | test (découpe) | blend (dégradé) | data (X d'une DXT5nm, hauteur)
     tile_x: bool = False
     tile_y: bool = False
     alpha_ref: float = 0.5
@@ -91,13 +92,17 @@ def choose_format(src_fmt: str, src_is_dds: bool, an: Analysis, cfg: dict, *, da
     if policy == "match" or (data and policy != "bgra8"):
         if src_is_dds and (src_fmt in dds.WRITABLE_FORMATS or src_fmt in dds.DX10_WRITE):
             fmt = src_fmt
+        elif src_is_dds and (an.normal_packing or src_fmt in ("BC4", "BC5")):
+            # BC4/BC5 (ATI1/ATI2) : canaux de données ; DXT1 les détruirait, BGRA8 les garde tels quels
+            fmt = "BGRA8"
+            notes.append(tr("{src_fmt} (canaux de données) non inscriptible : BGRA8 sans perte", src_fmt=src_fmt))
         elif src_is_dds:
             fmt = auto()
-            notes.append(f"format d'origine {src_fmt} non inscriptible : {fmt}")
+            notes.append(tr("format d'origine {src_fmt} non inscriptible : {fmt}", src_fmt=src_fmt, fmt=fmt))
         else:
             # original PNG/TGA (format du jeu inconnu) : sans perte, lisible par D3D9
             fmt = "BGRA8"
-            notes.append("original non DDS : BGRA8 sans perte (dds_format = \"auto\" pour compresser en DXT)")
+            notes.append(tr("original non DDS : BGRA8 sans perte (dds_format = \"auto\" pour compresser en DXT)"))
     elif policy == "auto":
         fmt = auto()
     elif policy == "dxt1":
@@ -109,27 +114,27 @@ def choose_format(src_fmt: str, src_is_dds: bool, an: Analysis, cfg: dict, *, da
     elif policy == "bc7":
         fmt = _srgb_variant("BC7", src_srgb, True)
     else:
-        raise ValueError(f"dds_format inconnu : {policy}")
+        raise ValueError(tr("dds_format inconnu : {policy}", policy=policy))
 
     # Dégradé d'alpha : DXT1 ne stocke qu'un alpha tout-ou-rien
     if alpha == "gradient" and dds.codec_of(fmt) == "DXT1":
         fmt = {"DXT1": "DXT5", "BC1": "BC3", "BC1_SRGB": "BC3_SRGB"}[fmt]
-        notes.append("alpha en dégradé : DXT1 → DXT5")
+        notes.append(tr("alpha en dégradé : DXT1 → DXT5"))
 
     # BC7 : Direct3D 11 uniquement (dgVoodoo2 + Special K), et seulement avec texconv
     if dds.codec_of(fmt) == "BC7":
         if api != "d3d11" or not qc.get("allow_bc7", False):
             fmt = _srgb_variant("DXT5" if alpha != "none" else "DXT1", fmt.endswith("_SRGB"), src_dx10)
-            notes.append("BC7 refusé (Direct3D 9/10 ne le lit pas ; target_api = \"d3d11\" et allow_bc7 = true "
-                         "pour dgVoodoo2 + Special K)")
+            notes.append(tr("BC7 refusé (Direct3D 9/10 ne le lit pas ; target_api = \"d3d11\" et allow_bc7 = true "
+                         "pour dgVoodoo2 + Special K)"))
         elif not can_bc7:
             fmt = _srgb_variant("DXT5", fmt.endswith("_SRGB"), True)
-            notes.append("BC7 impossible sans texconv : BC3")
+            notes.append(tr("BC7 impossible sans texconv : BC3"))
 
     # Direct3D 9 natif : pas d'en-tête DX10
     if api == "d3d9" and dds.needs_dx10(fmt) and not src_dx10:
         legacy = dds.LEGACY_OF.get(fmt, "BGRA8")
-        notes.append(f"{fmt} demande un en-tête DX10 : {legacy} (D3D9)")
+        notes.append(tr("{fmt} demande un en-tête DX10 : {legacy} (D3D9)", fmt=fmt, legacy=legacy))
         fmt = legacy
     return fmt, notes
 
@@ -147,15 +152,17 @@ def plan_for(img: Image.Image, an: Analysis, src_fmt: str, src_is_dds: bool, src
         levels = 1
     else:
         levels = dds.mip_count_full(w, h)
-    if an.normal_map:
-        space = "normal"
+    if an.normal_packing == "xyz" or (an.normal_map and not an.normal_packing):
+        space = "normal"                 # vecteurs renormalisés à chaque niveau
+    elif an.normal_packing:
+        space = "linear"                 # DXT5nm, BC5 : X et Y moyennés, Z recalculé par le shader
     elif data or src_fmt in DATA_FORMATS:
         space = "linear"
     else:
         space = str(qc.get("mip_gamma", "srgb"))
-    alpha_mode = {"none": "none", "binary": "test", "gradient": "blend"}[an.alpha_class]
+    alpha_mode = "data" if an.alpha_data else {"none": "none", "binary": "test", "gradient": "blend"}[an.alpha_class]
     if codec in ("BGRX8", "BGR8", "R5G6B5", "X1R5G5B5", "L8") and alpha_mode != "none":
-        notes.append(f"{fmt} sans alpha : transparence perdue")
+        notes.append(tr("{fmt} sans alpha : transparence perdue", fmt=fmt))
     return DDSPlan(fmt, codec, levels, w, h, space, alpha_mode, an.tile_x, an.tile_y,
                    float(qc.get("alpha_ref", 0.5)), notes)
 
@@ -168,7 +175,7 @@ def fit_block_size(img: Image.Image, plan_codec: str) -> tuple[Image.Image, str 
     W, H = max(4, round(w / 4) * 4), max(4, round(h / 4) * 4)
     if (W, H) == (w, h):
         return img, None
-    return img.resize((W, H), LANCZOS), f"{w}x{h} → {W}x{H} (multiple de 4 exigé par DXT)"
+    return img.resize((W, H), LANCZOS), tr("{w}x{h} → {W}x{H} (multiple de 4 exigé par DXT)", w=w, h=h, W=W, H=H)
 
 
 # ------------------------------------------------------------------ chaîne de mipmaps
@@ -214,7 +221,8 @@ def build_chain(img: Image.Image, plan: DDSPlan, mip_filter: str = "lanczos") ->
     for i in range(1, plan.levels):
         size = dds.level_dims(W, H, i)
         c = resize_f32(c, size, resample, plan.tile_x, plan.tile_y)
-        a = np.clip(resize_f32(a, size, BOX, plan.tile_x, plan.tile_y), 0, 1)
+        # alpha-donnée (X d'une DXT5nm) : même filtre que les couleurs, sinon X et Y divergent
+        a = np.clip(resize_f32(a, size, resample if plan.alpha_mode == "data" else BOX, plan.tile_x, plan.tile_y), 0, 1)
         col = c
         if plan.alpha_mode == "blend":
             col = np.where(a[..., None] > 1e-4, c / np.maximum(a[..., None], 1e-4), 0)
@@ -237,7 +245,7 @@ def build_chain(img: Image.Image, plan: DDSPlan, mip_filter: str = "lanczos") ->
             alpha = np.ones_like(a)
         lvl = np.concatenate([rgb, alpha[..., None]], axis=-1)
         chain.append(np.clip(lvl * 255.0 + 0.5, 0, 255).astype(np.uint8))
-    if plan.codec == "DXT1" and plan.alpha_mode != "none":
+    if plan.codec == "DXT1" and plan.alpha_mode in ("test", "blend"):
         # DXT1 : alpha sur 1 bit, seuillé ici au seuil du test alpha (indépendant de l'encodeur)
         thr = round(plan.alpha_ref * 255)
         for lvl in chain:
@@ -263,17 +271,23 @@ class BuiltinEncoder:
         for key, rgba, codec in jobs:
             if codec in dds.BLOCK_BYTES:
                 if codec not in self.block_codecs:
-                    raise EncoderError(f"encodeur intégré : {codec} non géré")
+                    raise EncoderError(tr("encodeur intégré : {codec} non géré", codec=codec))
                 out[key] = dds.encode_blocks(rgba, codec)
             else:
                 out[key] = dds._encode_level_uncompressed(Image.fromarray(rgba, "RGBA"), codec)
         return out
 
 
+def is_texconv_name(p: Path | str) -> bool:
+    """texconv est lancé une fois par niveau de mipmap : un autre exécutable choisi par erreur
+    (celui du jeu, par exemple) ne doit jamais l'être à sa place."""
+    return Path(p).stem.lower().startswith("texconv")
+
+
 def find_texconv(cfg: dict) -> Path | None:
     raw = str(cfg["qc"].get("texconv_exe", "") or "")
     cands: list[Path] = []
-    if raw:
+    if raw and is_texconv_name(raw):
         p = Path(raw)
         cands.append(p if p.is_absolute() else Path(cfg.get("_base", ".")) / p)
     found = shutil.which("texconv") or shutil.which("texconv.exe")
@@ -336,22 +350,23 @@ class TexconvEncoder:
                 try:
                     proc = subprocess.run(base + chunk, capture_output=True, timeout=timeout, cwd=str(run_dir))
                 except subprocess.TimeoutExpired as exc:
-                    raise EncoderError(f"texconv : délai de {timeout:.0f} s dépassé") from exc
+                    raise EncoderError(tr("texconv : délai de {timeout:.0f} s dépassé", timeout=timeout)) from exc
                 except OSError as exc:
-                    raise EncoderError(f"texconv : lancement impossible ({exc})") from exc
+                    raise EncoderError(tr("texconv : lancement impossible ({exc})", exc=exc)) from exc
                 if proc.returncode != 0:
                     tail = (proc.stdout + proc.stderr).decode("utf-8", "replace").strip().splitlines()[-3:]
-                    raise EncoderError(f"texconv code {proc.returncode} : {' | '.join(tail)}")
-            self.log(f"[DDS] texconv {TEXCONV_FORMAT[codec]} : {len(jobs)} niveau(x) en {time.monotonic() - t0:.1f} s")
+                    raise EncoderError(tr("texconv code {code} : {tail}", code=proc.returncode, tail=" | ".join(tail)))
+            self.log(tr("[DDS] texconv {fmt} : {n} niveau(x) en {seconds:.1f} s",
+                        fmt=TEXCONV_FORMAT[codec], n=len(jobs), seconds=time.monotonic() - t0))
             produced = {p.stem.lower(): p for p in out_dir.iterdir() if p.suffix.lower() == ".dds"}
             result: dict[str, bytes] = {}
             for stem, (key, w, h) in names.items():
                 f = produced.get(stem)
                 if f is None:
-                    raise EncoderError(f"texconv : sortie absente pour {stem}")
+                    raise EncoderError(tr("texconv : sortie absente pour {stem}", stem=stem))
                 _info, got, levels = dds.split_levels(f.read_bytes())
                 if got != codec:
-                    raise EncoderError(f"texconv : format {got} reçu au lieu de {codec}")
+                    raise EncoderError(tr("texconv : format {got} reçu au lieu de {codec}", got=got, codec=codec))
                 result[key] = levels[0][2]
             return result
         finally:
@@ -378,7 +393,7 @@ def make_encoder(cfg: dict, name: str | None = None, log: Callable[[str], None] 
     exe = find_texconv(cfg)
     if exe is None:
         if choice == "texconv":
-            raise EncoderError("texconv introuvable : renseigne [qc] texconv_exe ou place texconv.exe dans tools/")
+            raise EncoderError(tr("texconv introuvable : renseigne [qc] texconv_exe ou place texconv.exe dans tools/"))
         return BuiltinEncoder()
     return TexconvEncoder(exe, cfg, log)
 
@@ -403,13 +418,14 @@ def verify(data: bytes, plan: DDSPlan, chain: list[np.ndarray]) -> dict:
     try:
         info, codec, levels = dds.split_levels(data)
     except dds.DDSError as exc:
-        res.update(ok=False, errors=[f"relecture : {exc}"])
+        res.update(ok=False, errors=[tr("relecture : {exc}", exc=exc)])
         return res
     if (info.width, info.height) != (plan.width, plan.height) or len(levels) != len(chain):
-        res["errors"].append(f"en-tête {info.width}x{info.height}/{len(levels)} niv. au lieu de "
-                             f"{plan.width}x{plan.height}/{len(chain)}")
+        res["errors"].append(tr("en-tête {width}x{height}/{n} niv. au lieu de {width2}x{height2}/{n2}",
+                                width=info.width, height=info.height, n=len(levels), width2=plan.width,
+                                height2=plan.height, n2=len(chain)))
     if codec != plan.codec:
-        res["errors"].append(f"format relu {codec} au lieu de {plan.codec}")
+        res["errors"].append(tr("format relu {codec} au lieu de {codec2}", codec=codec, codec2=plan.codec))
     psnrs, cov, bright = [], [], []
     thr = plan.alpha_ref * 255
     ref_cov = float((chain[0][..., 3] >= thr).mean()) if plan.alpha_mode == "test" else None
@@ -418,12 +434,13 @@ def verify(data: bytes, plan: DDSPlan, chain: list[np.ndarray]) -> dict:
         try:
             dec = dds.decode_level(codec, w, h, payload)
         except Exception as exc:
-            res["errors"].append(f"niveau {i} illisible : {exc}")
+            res["errors"].append(tr("niveau {i} illisible : {exc}", i=i, exc=exc))
             break
         if dec.shape[:2] != ref.shape[:2]:
-            res["errors"].append(f"niveau {i} : taille {dec.shape[1]}x{dec.shape[0]}")
+            res["errors"].append(tr("niveau {i} : taille {shape1}x{shape0}",
+                                    i=i, shape1=dec.shape[1], shape0=dec.shape[0]))
             break
-        m = ref[..., 3] >= thr if plan.alpha_mode != "none" else np.ones(ref.shape[:2], bool)
+        m = ref[..., 3] >= thr if plan.alpha_mode in ("test", "blend") else np.ones(ref.shape[:2], bool)
         if m.sum() >= 16:
             p = _psnr(dec[..., :3][m], ref[..., :3][m])
             psnrs.append(p)
@@ -471,7 +488,7 @@ def encode_many(items: dict[str, tuple[DDSPlan, list[np.ndarray]]], encoder, *, 
     except EncoderError as exc:
         if isinstance(encoder, BuiltinEncoder):
             return {tid: exc for tid in items}
-        log(f"[DDS] {exc} — repli sur l'encodeur intégré")
+        log(tr("[DDS] {exc} — repli sur l'encodeur intégré", exc=exc))
         used = "builtin (repli)"
         builtin = BuiltinEncoder()
         # BC7 n'a pas d'encodeur intégré : même famille DX10, en BC3
@@ -479,7 +496,7 @@ def encode_many(items: dict[str, tuple[DDSPlan, list[np.ndarray]]], encoder, *, 
             if plan.codec == "BC7":
                 plan.fmt = "BC3_SRGB" if plan.fmt.endswith("_SRGB") else "BC3"
                 plan.codec = "DXT5"
-                plan.notes.append("texconv indisponible : BC3 au lieu de BC7")
+                plan.notes.append(tr("texconv indisponible : BC3 au lieu de BC7"))
         jobs = [(key, lvl, items[key.split("\x00")[0]][0].codec) for key, lvl, _c in jobs]
         encoded = builtin.encode(jobs)
     out: dict[str, DDSOutput | Exception] = {}
@@ -487,7 +504,7 @@ def encode_many(items: dict[str, tuple[DDSPlan, list[np.ndarray]]], encoder, *, 
         try:
             payloads = [encoded[f"{tid}\x00{i}"] for i in range(len(chain))]
         except KeyError:
-            out[tid] = EncoderError(f"aucun encodeur disponible pour {plan.codec}")
+            out[tid] = EncoderError(tr("aucun encodeur disponible pour {codec}", codec=plan.codec))
             continue
         try:
             data = assemble(plan, chain, payloads)

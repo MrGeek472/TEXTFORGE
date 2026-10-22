@@ -14,6 +14,7 @@ from pathlib import Path
 import numpy as np
 from PIL import Image
 
+from .i18n import tr
 from . import dds
 
 IMAGE_EXTS = {".dds", ".png", ".tga", ".bmp", ".jpg", ".jpeg"}
@@ -129,9 +130,76 @@ class Analysis:
     normal_map: bool
     mode: str               # "ai" | "upscale" | "keep"
     reason: str
+    # rangement d'une normal map : "xyz" (Z dans le bleu), "ag" (DXT5nm : X dans l'alpha, Y dans le
+    # vert, Unity et d'autres), "rg" (deux canaux, BC5/ATI2 : X rouge, Y vert) ; "" : pas une normal map
+    normal_packing: str = ""
 
     def to_dict(self) -> dict:
         return asdict(self)
+
+    @property
+    def alpha_data(self) -> bool:
+        """L'alpha est une donnée (X d'une normal map DXT5nm, hauteur de parallaxe), pas une
+        transparence : ni fond étendu sous l'alpha, ni prémultiplication, ni test de couverture."""
+        return bool(self.normal_packing) and self.alpha_class != "none"
+
+    @property
+    def cutout(self) -> bool:
+        """Transparence réelle (découpe ou dégradé)."""
+        return self.alpha_class != "none" and not self.alpha_data
+
+
+def opaque_rgba(img: Image.Image, an: Analysis) -> Image.Image:
+    """Couleurs prêtes à filtrer : sous une transparence réelle, fond étendu depuis les zones
+    visibles ; une normal map garde ses canaux tels quels (l'alpha y est une donnée)."""
+    return bleed_rgb(img) if an.cutout else img.convert("RGBA")
+
+
+def detect_normal_packing(arr: np.ndarray, alpha_class: str) -> str:
+    """Normal map, et comment ses composantes sont rangées. Une normale a une longueur de 1 :
+    X et Y restent dans le disque unité, et une carte de relief vaut en moyenne « plat » (0,5 ; 0,5)."""
+    h, w = arr.shape[:2]
+    st = max(1, max(h, w) // 256)
+    r, g, b, a = (c.ravel() for c in np.moveaxis(arr[::st, ::st, :4], -1, 0))
+
+    def flat(c: np.ndarray) -> bool:
+        return float(c.std()) < 0.02
+
+    def centered(c: np.ndarray, tol: float = 0.12) -> bool:
+        return abs(float(c.mean()) - 0.5) < tol
+
+    def in_disc(x: np.ndarray, y: np.ndarray) -> bool:
+        X, Y = 2 * x - 1, 2 * y - 1
+        return float((X * X + Y * Y <= 1.08).mean()) > 0.97
+
+    def independent(x: np.ndarray, y: np.ndarray) -> bool:
+        """Pentes X et Y peu liées ; les canaux d'une image en couleur suivent tous la luminosité."""
+        if x.std() < 1e-4 or y.std() < 1e-4:
+            return True
+        return abs(float(np.corrcoef(x, y)[0, 1])) < 0.85
+
+    # Z dans le bleu : règle historique sans alpha ; avec alpha (hauteur), on vérifie en plus la
+    # longueur des vecteurs, pour ne pas prendre une vitre bleutée pour une carte de relief
+    if float(b.mean()) > 0.7 and centered(r) and centered(g):
+        if alpha_class == "none":
+            return "xyz"
+        n = np.stack([2 * r - 1, 2 * g - 1, 2 * b - 1])
+        length = np.sqrt((n * n).sum(axis=0))
+        if float(((length > 0.8) & (length < 1.2)).mean()) > 0.9:
+            return "xyz"
+    # DXT5nm : X dans l'alpha, Y dans le vert ; rouge et bleu vidés (ou recopiés du vert)
+    if (alpha_class == "gradient" and centered(a) and centered(g) and max(a.std(), g.std()) > 0.01
+            and in_disc(a, g) and independent(a, g)):
+        def unused(c: np.ndarray) -> bool:
+            return flat(c) or float(np.abs(c - g).mean()) < 0.02
+        if unused(r) and unused(b):
+            return "ag"
+    # deux canaux (BC5/ATI2) : X dans le rouge, Y dans le vert, bleu vide
+    if (alpha_class == "none" and flat(b) and float(b.std()) < 0.25 * max(r.std(), g.std())
+            and centered(r, 0.08) and centered(g, 0.08) and max(r.std(), g.std()) > 0.02
+            and in_disc(r, g) and independent(r, g)):
+        return "rg"
+    return ""
 
 
 def seam_stats(arr: np.ndarray, axis: int) -> tuple[float, float, float]:
@@ -175,12 +243,24 @@ def _tileable_at(arr: np.ndarray, axis: int, threshold: float) -> bool:
     seam, p95, _mx = seam_stats(arr, axis)
     if seam <= threshold * max(p95, 1e-4):
         return True
+    return seam_joint(arr, axis) < JOINT_MATCH
+
+
+JOINT_MATCH = 0.35      # en dessous : le saut au bord reproduit une transition interne (joint)
+
+
+def seam_joint(arr: np.ndarray, axis: int) -> float:
+    """Distance relative entre le saut au raccord, ligne par ligne, et la transition interne
+    qui lui ressemble le plus (0 = identique). Petite : le bord tombe sur un joint qui existe
+    aussi à l'intérieur (carrelage, mortier), le raccord est une arête voulue."""
     rgb = arr[..., :3] if axis == 1 else arr[..., :3].transpose(1, 0, 2)
     s = np.abs(rgb[:, -1] - rgb[:, 0])                       # (lignes, 3)
     d = np.abs(np.diff(rgb, axis=1))                         # (lignes, paires, 3)
+    if d.shape[1] == 0:
+        return 1.0
     norm = max(float(np.sqrt((s * s).sum())), 1e-6)
     dist = np.sqrt(((d - s[:, None, :]) ** 2).sum(axis=(0, 2))) / norm
-    return bool(dist.min() < 0.35)
+    return float(dist.min())
 
 
 def classify_alpha(alpha: np.ndarray) -> str:
@@ -200,9 +280,8 @@ def analyze(img: Image.Image, cfg: dict) -> Analysis:
     lum = luminance(rgb)
     lum_std = float(lum.std())
     chroma_std = float((rgb - lum[:, None]).std())
-    mean = rgb.mean(axis=0)
-    normal_map = bool(mean[2] > 0.7 and abs(mean[0] - 0.5) < 0.12 and abs(mean[1] - 0.5) < 0.12
-                      and alpha_class == "none")
+    packing = detect_normal_packing(arr, alpha_class)
+    normal_map = bool(packing)
     # Détail local = énergie du laplacien, mesurée à 64 px max pour ne pas dépendre
     # de la résolution. Un dégradé (ciel, vitre) a un laplacien quasi nul.
     small = img if max(w, h) <= 64 else img.resize(
@@ -219,30 +298,30 @@ def analyze(img: Image.Image, cfg: dict) -> Analysis:
     tile_y = h >= 8 and is_tileable(arr, 0, thr)
     # Bords presque entièrement transparents (icône, feuillage découpé) : rien à raccorder
     a = arr[..., 3]
-    if tile_x and ((a[:, 0] < 0.5).mean() > 0.9 and (a[:, -1] < 0.5).mean() > 0.9):
+    if tile_x and not packing and ((a[:, 0] < 0.5).mean() > 0.9 and (a[:, -1] < 0.5).mean() > 0.9):
         tile_x = False
-    if tile_y and ((a[0, :] < 0.5).mean() > 0.9 and (a[-1, :] < 0.5).mean() > 0.9):
+    if tile_y and not packing and ((a[0, :] < 0.5).mean() > 0.9 and (a[-1, :] < 0.5).mean() > 0.9):
         tile_y = False
 
     min_size = int(ac.get("min_ai_size", 32))
     copy_below = int(ac.get("copy_below", 8))
     aspect = max(w, h) / max(1, min(w, h))
     if max(w, h) < copy_below:
-        mode, reason = "keep", "minuscule (table de couleurs probable)"
+        mode, reason = "keep", tr("minuscule (table de couleurs probable)")
     elif max(w, h) < min_size:
-        mode, reason = "upscale", f"plus petite que {min_size}px"
+        mode, reason = "upscale", tr("plus petite que {min_size}px", min_size=min_size)
     elif lum_std < 0.015 and chroma_std < 0.015:
-        mode, reason = "upscale", "couleur quasi unie"
+        mode, reason = "upscale", tr("couleur quasi unie")
     elif smooth:
-        mode, reason = "upscale", "dégradé lisse, sans détail à réinterpréter"
+        mode, reason = "upscale", tr("dégradé lisse, sans détail à réinterpréter")
     elif normal_map:
-        mode, reason = "upscale", "carte de relief probable (normal map)"
+        mode, reason = "upscale", tr("carte de relief probable (normal map)")
     elif aspect > float(ac.get("max_ai_aspect", 3.0)):
-        mode, reason = "upscale", f"format très allongé ({aspect:.1f}:1)"
+        mode, reason = "upscale", tr("format très allongé ({aspect:.1f}:1)", aspect=aspect)
     else:
-        mode, reason = "ai", "texture de couleur"
+        mode, reason = "ai", tr("texture de couleur")
     return Analysis(w, h, alpha_class, bool(tile_x), bool(tile_y), lum_std, chroma_std,
-                    normal_map, mode, reason)
+                    normal_map, mode, reason, packing)
 
 
 # ---------------------------------------------------------------- taille de sortie
@@ -299,7 +378,7 @@ class PrepInfo:
 def prepare_for_model(img: Image.Image, an: Analysis, cfg: dict, ratios: list[str]) -> tuple[Image.Image, PrepInfo]:
     """Construit l'image envoyée au modèle et mémorise comment l'inverser."""
     w, h = img.size
-    base = bleed_rgb(img) if an.alpha_class != "none" else img.convert("RGBA")
+    base = opaque_rgba(img, an)
     arr = np.asarray(base)[..., :3]
     frac = float(cfg["analysis"].get("wrap_fraction", 0.125))
     px = max(1, round(w * frac)) if an.tile_x else 0
@@ -333,7 +412,7 @@ def prepare_native(img: Image.Image, an: Analysis) -> tuple[Image.Image, PrepInf
     """Entrée d'un moteur qui gère lui-même le raccord et la résolution (workflow ComfyUI) :
     texture à sa taille d'origine, transparence remplie, aucune marge."""
     w, h = img.size
-    base = bleed_rgb(img) if an.alpha_class != "none" else img.convert("RGBA")
+    base = opaque_rgba(img, an)
     return base.convert("RGB"), PrepInfo(w, h, 0, 0, w, h, "1:1", "stretch", (0.0, 0.0, 1.0, 1.0), w, h)
 
 
@@ -402,7 +481,7 @@ def finalize_ai(output: Image.Image, src: Image.Image, an: Analysis, prep: PrepI
     ref_rgba = local_upscale(src, k, an, cfg, use_esrgan=False)
     ref = to_f32(ref_rgba)
     src_alpha = ref[..., 3]
-    mask = src_alpha > 0.5 if an.alpha_class != "none" else np.ones(src_alpha.shape, bool)
+    mask = src_alpha > 0.5 if an.cutout else np.ones(src_alpha.shape, bool)
     drift = float(np.abs(arr[mask].mean(axis=0) - ref[..., :3][mask].mean(axis=0)).mean() * 255) if mask.any() else 0.0
     strength = float(cfg["quality"].get("color_match", 0.6))
     rgb = color_match(arr, ref[..., :3], mask, strength)
@@ -445,9 +524,37 @@ def _wrap_resize(arr: np.ndarray, size: tuple[int, int], tx: bool, ty: bool) -> 
 
 # ---------------------------------------------------------------- agrandissement local
 
+def resize_channel(ch: np.ndarray, size: tuple[int, int], tx: bool, ty: bool) -> np.ndarray:
+    """Un canal flottant, Lanczos, en boucle sur les axes répétables. Canal par canal : Pillow
+    prémultiplie l'alpha d'une image RGBA, ce qui fausserait une normal map DXT5nm."""
+    h, w = ch.shape
+    m = 4
+    px, py = (min(m, w) if tx else 0), (min(m, h) if ty else 0)
+    padded = np.pad(ch.astype(np.float32), ((py, py), (px, px)), mode="wrap" if (tx or ty) else "edge")
+    kx, ky = size[0] / w, size[1] / h
+    big = np.asarray(Image.fromarray(padded, "F").resize((round((w + 2 * px) * kx), round((h + 2 * py) * ky)),
+                                                         LANCZOS))
+    ox, oy = round(px * kx), round(py * ky)
+    return big[oy:oy + size[1], ox:ox + size[0]]
+
+
+def upscale_normal_map(src: Image.Image, size: tuple[int, int], an: Analysis) -> Image.Image:
+    """Agrandissement d'une carte de relief : chaque composante filtrée de la même façon, sans IA
+    (une IA d'image y verrait des couleurs et y inventerait du relief). Z dans le bleu : vecteurs
+    renormalisés ; DXT5nm et BC5 : Z est recalculé par le shader, les canaux restent tels quels."""
+    arr = to_f32(src)
+    out = np.stack([resize_channel(arr[..., c], size, an.tile_x, an.tile_y) for c in range(4)], axis=-1)
+    if an.normal_packing == "xyz":
+        n = out[..., :3] * 2 - 1
+        n /= np.maximum(np.linalg.norm(n, axis=-1, keepdims=True), 1e-6)
+        out[..., :3] = (n + 1) * 0.5
+    out[..., 3] = final_alpha(src, an, size)
+    return from_f32(np.clip(out, 0, 1))
+
+
 def _esrgan(img: Image.Image, exe: str, model: str) -> Image.Image | None:
-    if not exe or not Path(exe).exists():
-        return None
+    if not exe or "realesrgan" not in Path(exe).stem.lower() or not Path(exe).exists():
+        return None                       # jamais un autre programme choisi par erreur
     with tempfile.TemporaryDirectory() as td:
         i, o = Path(td) / "in.png", Path(td) / "out.png"
         img.convert("RGB").save(i)
@@ -465,7 +572,9 @@ def local_upscale(src: Image.Image, k: int, an: Analysis, cfg: dict, use_esrgan:
     """Agrandissement sans IA générative : Real-ESRGAN si configuré, sinon Lanczos.
     Sert de repli et de référence pour la validation."""
     W, H = src.width * k, src.height * k
-    base = bleed_rgb(src) if an.alpha_class != "none" else src.convert("RGBA")
+    if an.normal_packing:
+        return upscale_normal_map(src, (W, H), an)
+    base = opaque_rgba(src, an)
     rgb = None
     if use_esrgan and k > 1:
         lc = cfg.get("local", {})

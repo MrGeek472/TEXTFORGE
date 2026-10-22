@@ -22,17 +22,23 @@ from typing import Callable
 import numpy as np
 from PIL import Image
 
-from .imaging import LANCZOS, Analysis, _wrap_resize, bleed_rgb, final_alpha, local_upscale, to_f32
+from .i18n import N_, tr
+from .imaging import (JOINT_MATCH, LANCZOS, Analysis, _wrap_resize, bleed_rgb, final_alpha, local_upscale,
+                      opaque_rgba, seam_joint, to_f32)
 from .metrics import (box, color_stats, detail_energy, masked_blur, ms_ssim, palette_distance, resize_f32,
                       seam_alignment, seam_local, seam_ratios, seam_step)
 from .validate import evaluate
 
 BOX = Image.Resampling.BOX
-QC_VERSION = 3          # à incrémenter quand les mesures changent : les résultats en cache sont recontrôlés
+QC_VERSION = 4          # à incrémenter quand les mesures changent : les résultats en cache sont recontrôlés
 
 DECISIONS = ("validated", "corrected", "rejected", "local", "measured", "error")
-LABELS = {"validated": "validée", "corrected": "corrigée", "rejected": "rejetée", "local": "locale",
-          "measured": "mesurée (choix manuel)", "error": "erreur"}
+LABELS = {"validated": N_("validée"), "corrected": N_("corrigée"), "rejected": N_("rejetée"), "local": N_("locale"),
+          "measured": N_("mesurée (choix manuel)"), "error": N_("erreur")}          # tr(LABELS[…]) à l'affichage
+
+
+def label_of(decision: str) -> str:
+    return tr(LABELS[decision]) if decision in LABELS else decision
 
 
 @dataclass
@@ -62,7 +68,7 @@ class QCResult:
 
     @property
     def label(self) -> str:
-        return LABELS.get(self.decision, self.decision)
+        return label_of(self.decision)
 
 
 # ------------------------------------------------------------------ préparation
@@ -75,9 +81,10 @@ def to_target(img: Image.Image, original: Image.Image, an: Analysis, k: int) -> 
     if rgb.size != (W, H):
         ar_c, ar_o = rgb.width / rgb.height, original.width / original.height
         if abs(np.log(ar_c / ar_o)) > 0.02:
-            notes.append(f"proportions {rgb.width}x{rgb.height} ≠ original {original.width}x{original.height}")
+            notes.append(tr("proportions {w}x{h} ≠ original {ow}x{oh}", w=rgb.width, h=rgb.height,
+                            ow=original.width, oh=original.height))
         if rgb.width < W or rgb.height < H:
-            notes.append(f"résolution {rgb.width}x{rgb.height} < cible {W}x{H} : agrandie")
+            notes.append(tr("résolution {w}x{h} < cible {tw}x{th} : agrandie", w=rgb.width, h=rgb.height, tw=W, th=H))
         if an.tile_x or an.tile_y:
             arr = _wrap_resize(np.asarray(rgb), (W, H), an.tile_x, an.tile_y)
         else:
@@ -86,7 +93,7 @@ def to_target(img: Image.Image, original: Image.Image, an: Analysis, k: int) -> 
         arr = np.asarray(rgb)
     alpha = (final_alpha(original, an, (W, H)) * 255 + 0.5).astype(np.uint8)
     out = Image.fromarray(np.concatenate([arr[..., :3], alpha[..., None]], axis=-1), "RGBA")
-    if an.alpha_class != "none":
+    if an.cutout:
         # couleurs sous la transparence : étendues depuis les zones visibles (pas de liseré)
         bled = np.asarray(bleed_rgb(out))
         out = Image.fromarray(np.concatenate([bled[..., :3], alpha[..., None]], axis=-1), "RGBA")
@@ -96,7 +103,7 @@ def to_target(img: Image.Image, original: Image.Image, an: Analysis, k: int) -> 
 def _baseline(item: QCItem) -> np.ndarray:
     """Agrandissement Lanczos de l'original : référence « sans détail ajouté »."""
     W, H = item.original.width * item.k, item.original.height * item.k
-    base = bleed_rgb(item.original) if item.an.alpha_class != "none" else item.original.convert("RGBA")
+    base = opaque_rgba(item.original, item.an)
     return _wrap_resize(np.asarray(base)[..., :3], (W, H), item.an.tile_x, item.an.tile_y).astype(np.float32) / 255.0
 
 
@@ -110,8 +117,8 @@ def measure(item: QCItem, img: Image.Image, cfg: dict, baseline: np.ndarray | No
     c = cfg["quality"]
     an, o = item.an, item.original
     w, h = o.size
-    ref = to_f32(bleed_rgb(o) if an.alpha_class != "none" else o.convert("RGBA"))
-    mask = to_f32(o)[..., 3] > 0.5 if an.alpha_class != "none" else np.ones((h, w), bool)
+    ref = to_f32(opaque_rgba(o, an))
+    mask = to_f32(o)[..., 3] > 0.5 if an.cutout else np.ones((h, w), bool)
     if mask.sum() < 16:
         mask = np.ones((h, w), bool)
     full = to_f32(img)
@@ -154,11 +161,14 @@ def measure(item: QCItem, img: Image.Image, cfg: dict, baseline: np.ndarray | No
     #   full/low : cassure par rapport aux transitions courantes de la texture (pleine résolution, 4x4)
     #   local    : cassure par rapport aux colonnes voisines du bord (joint qui ne se rejoint pas)
     #   step     : dérive de couleur d'un bord à l'autre, comparée à l'original (ΔE)
+    # plus « joint » : à la résolution d'origine, le saut au bord reproduit-il une transition
+    # interne du rendu, l'original ayant lui aussi un joint au bord ? (carrelage posé pile au bord)
     seams = {}
     base = baseline if baseline is not None else _baseline(item)
     if an.tile_x or an.tile_y:
         lim = float(c.get("max_seam_ratio", 1.8))
         lim_local = float(cfg["qc"].get("max_seam_local", 1.6))
+        q_joint = float(cfg["qc"].get("seam_joint_match", JOINT_MATCH))
         for axis, on, nm in ((1, an.tile_x, "x"), (0, an.tile_y, "y")):
             if not on:
                 continue
@@ -168,7 +178,12 @@ def measure(item: QCItem, img: Image.Image, cfg: dict, baseline: np.ndarray | No
                 cache[("seam", axis)] = (*seam_ratios(base, axis), seam_local(base, axis, 2 * item.k))
             r_full, r_low, r_loc = cache[("seam", axis)]
             shift, gain = seam_alignment(full[..., :3], axis, 4 * item.k)
+            if ("joint", axis) not in cache:
+                cache[("joint", axis)] = seam_joint(ref[..., :3], axis)
             seams[nm] = {"full": round(f_full, 3), "low": round(f_low, 3), "local": round(f_loc, 3),
+                         "joint": round(seam_joint(down, axis), 3), "joint_ref": round(cache[("joint", axis)], 3),
+                         # le rendu doit reproduire le joint au moins aussi bien que l'original (marge 25 %)
+                         "limit_joint": round(min(float(q_joint), max(0.12, 1.25 * cache[("joint", axis)])), 3),
                          "step": round(seam_step(down, ref[..., :3], axis, mask), 2),
                          "align_shift": shift, "align_gain": round(gain, 3),
                          "limit_full": round(max(lim, r_full * 1.25), 3),
@@ -177,7 +192,7 @@ def measure(item: QCItem, img: Image.Image, cfg: dict, baseline: np.ndarray | No
     m["seam"] = seams
 
     # détail : gain par rapport à un simple agrandissement, et niveau absolu de grain
-    big_mask = full[..., 3] > 0.5 if an.alpha_class != "none" else None
+    big_mask = full[..., 3] > 0.5 if an.cutout else None
     if "detail" not in cache:
         cache["detail"] = detail_energy(base, big_mask)
     e_gen, e_base = detail_energy(full[..., :3], big_mask), cache["detail"]
@@ -198,52 +213,65 @@ def judge(m: dict, item: QCItem, cfg: dict) -> tuple[dict[str, list[str]], list[
     warns: list[str] = []
     if not m.get("low_contrast"):
         if m["structure"] < float(c.get("min_structure", 0.65)):
-            fails["structure"].append(f"structure {m['structure']:.2f} < {c.get('min_structure', 0.65)}")
+            fails["structure"].append(tr("structure {v:.2f} < {lim}", v=m["structure"], lim=c.get("min_structure", 0.65)))
         if m["shift"] > float(c.get("max_shift", 0.03)):
-            fails["structure"].append(f"composition décalée ({m['shift']:.3f})")
+            fails["structure"].append(tr("composition décalée ({v:.3f})", v=m["shift"]))
         if m["local"] < float(c.get("min_local", 0.3)):
-            fails["structure"].append(f"zone réinventée (corrélation locale {m['local']:.2f})")
+            fails["structure"].append(tr("zone réinventée (corrélation locale {v:.2f})", v=m["local"]))
         if m["ssim"] < float(q.get("min_ssim", 0.5)):
-            fails["structure"].append(f"SSIM {m['ssim']:.2f} < {q.get('min_ssim', 0.5)}")
+            fails["structure"].append(tr("SSIM {v:.2f} < {lim}", v=m["ssim"], lim=q.get("min_ssim", 0.5)))
     if not item.data:
         if m["delta_e"] > float(q.get("max_delta_e", 6.0)):
-            fails["color"].append(f"ΔE moyen {m['delta_e']:.1f} > {q.get('max_delta_e', 6.0)}")
+            fails["color"].append(tr("ΔE moyen {v:.1f} > {lim}", v=m["delta_e"], lim=q.get("max_delta_e", 6.0)))
         if m["delta_e_p95"] > float(q.get("max_delta_e_p95", 14.0)):
-            fails["color"].append(f"zones recolorées (ΔE p95 {m['delta_e_p95']:.1f})")
+            fails["color"].append(tr("zones recolorées (ΔE p95 {v:.1f})", v=m["delta_e_p95"]))
         if m.get("hue_shift") is not None and abs(m["hue_shift"]) > float(q.get("max_hue_shift", 8.0)):
-            fails["color"].append(f"teinte {m['hue_shift']:+.1f}°")
+            fails["color"].append(tr("teinte {v:+.1f}°", v=m["hue_shift"]))
         cr = m.get("chroma_ratio")
         if cr is not None and not (float(q.get("min_chroma_ratio", 0.7)) <= cr <= float(q.get("max_chroma_ratio", 1.4))):
-            fails["color"].append(f"saturation ×{cr:.2f}")
+            fails["color"].append(tr("saturation ×{v:.2f}", v=cr))
         if abs(m["lightness_shift"]) > float(q.get("max_lightness_shift", 6.0)):
-            fails["color"].append(f"luminosité {m['lightness_shift']:+.1f} L*")
+            fails["color"].append(tr("luminosité {v:+.1f} L*", v=m["lightness_shift"]))
         if m["palette"] > float(q.get("max_palette_distance", 0.35)):
-            fails["color"].append(f"palette changée ({m['palette']:.2f})")
+            fails["color"].append(tr("palette changée ({v:.2f})", v=m["palette"]))
         if m["local_color"] > float(c.get("max_local_color", 0.12)) * 255:
-            fails["color"].append(f"couleur locale changée ({m['local_color']:.0f}/255)")
+            fails["color"].append(tr("couleur locale changée ({v:.0f}/255)", v=m["local_color"]))
         if not 0.67 <= m["contrast_ratio"] <= 1.5:
-            warns.append(f"contraste ×{m['contrast_ratio']:.2f}")
+            warns.append(tr("contraste ×{v:.2f}", v=m["contrast_ratio"]))
     max_step = float(q.get("max_seam_step", 4.0))
+    joint_match = float(q.get("seam_joint_match", JOINT_MATCH))
     for nm, s in m.get("seam", {}).items():
-        if s["full"] > s["limit_full"] or s["low"] > s["limit_low"]:
-            fails["seam"].append(f"raccord {nm} {max(s['full'], s['low']):.2f} > {s['limit_full']:.2f}")
+        # Joint au bord, dans l'original comme dans le rendu : l'arête est voulue. Un rendu plus
+        # net ou moins bruité que l'agrandissement de référence la fait ressortir davantage
+        # par rapport aux transitions internes, sans qu'il y ait de cassure.
+        joint = (s.get("joint_ref", 1.0) < joint_match
+                 and s.get("joint", 1.0) <= s.get("limit_joint", 0.0))
+        if joint:
+            pass
+        elif s["full"] > s["limit_full"]:
+            fails["seam"].append(tr("raccord {axis} {v:.2f} > {lim:.2f}", axis=nm, v=s["full"], lim=s["limit_full"]))
+        elif s["low"] > s["limit_low"]:
+            fails["seam"].append(tr("raccord {axis} {v:.2f} > {lim:.2f}", axis=nm, v=s["low"], lim=s["limit_low"]))
         elif s["local"] > s["limit_local"]:
-            fails["seam"].append(f"raccord {nm} : bords qui ne se rejoignent pas ({s['local']:.2f} > {s['limit_local']:.2f})")
+            fails["seam"].append(tr("raccord {axis} : bords qui ne se rejoignent pas ({v:.2f} > {lim:.2f})", axis=nm,
+                                    v=s["local"], lim=s["limit_local"]))
         if abs(s.get("align_shift", 0)) >= max(2, item.k) and s.get("align_gain", 0) > float(q.get("max_seam_align_gain", 0.3)):
-            fails["seam_align"].append(f"raccord {nm} : motifs décalés de {abs(s['align_shift'])} px au bord")
+            fails["seam_align"].append(tr("raccord {axis} : motifs décalés de {px} px au bord", axis=nm,
+                                          px=abs(s["align_shift"])))
         if s["step"] > max_step:
-            fails["seam_step"].append(f"raccord {nm} : dérive de couleur d'un bord à l'autre (ΔE {s['step']:.1f})")
+            fails["seam_step"].append(tr("raccord {axis} : dérive de couleur d'un bord à l'autre (ΔE {v:.1f})",
+                                         axis=nm, v=s["step"]))
     if "alpha_iou" in m and m["alpha_iou"] < float(q.get("min_alpha_iou", 0.97)):
-        fails["alpha"].append(f"découpe alpha IoU {m['alpha_iou']:.3f}")
+        fails["alpha"].append(tr("découpe alpha IoU {v:.3f}", v=m["alpha_iou"]))
     elif "alpha_error" in m and item.an.alpha_class == "gradient" and m["alpha_error"] > float(q.get("max_alpha_error", 0.03)):
-        fails["alpha"].append(f"alpha écart {m['alpha_error']:.3f}")
+        fails["alpha"].append(tr("alpha écart {v:.3f}", v=m["alpha_error"]))
     if item.source == "ai":
         if m["detail_gain"] is None:
             pass
         elif m["detail_gain"] < float(q.get("min_detail_gain", 1.1)):
-            warns.append(f"peu de détail ajouté (×{m['detail_gain']:.2f} vs agrandissement simple)")
+            warns.append(tr("peu de détail ajouté (×{v:.2f} vs agrandissement simple)", v=m["detail_gain"]))
         elif m["grain"] > float(q.get("max_grain", 0.11)) and m["detail_gain"] > 3:
-            warns.append(f"grain très fort ({m['grain']:.3f}) : bruit possible")
+            warns.append(tr("grain très fort ({v:.3f}) : bruit possible", v=m["grain"]))
     return {k: v for k, v in fails.items() if v}, warns
 
 
@@ -257,10 +285,10 @@ def color_lock(img: Image.Image, item: QCItem, strength: float) -> Image.Image:
     an, o = item.an, item.original
     w, h = o.size
     full = to_f32(img)
-    ref = to_f32(bleed_rgb(o) if an.alpha_class != "none" else o.convert("RGBA"))[..., :3]
+    ref = to_f32(opaque_rgba(o, an))[..., :3]
     down = resize_f32(full[..., :3], (w, h), BOX)
     resid = ref - down
-    if an.alpha_class != "none":
+    if an.cutout:
         m = to_f32(o)[..., 3] > 0.5
         resid = masked_blur(np.where(m[..., None], resid, 0), m, 1, 2)
     else:
@@ -335,7 +363,7 @@ def run_qc(item: QCItem, cfg: dict) -> QCResult:
             except Exception as exc:                  # repli amélioré indisponible : Lanczos
                 img, notes = to_target(local_upscale(item.original, item.k, item.an, cfg, use_esrgan=False),
                                        item.original, item.an, item.k)
-                return img, notes + [f"repli : {exc}"]
+                return img, notes + [tr("repli : {err}", err=exc)]
         return to_target(local_upscale(item.original, item.k, item.an, cfg, use_esrgan=False),
                          item.original, item.an, item.k)
 
@@ -357,12 +385,12 @@ def run_qc(item: QCItem, cfg: dict) -> QCResult:
         # choix fait à la main dans la galerie : mesuré, jamais modifié
         res.decision = "measured"
         if fails:
-            res.warnings.append("le QC aurait refusé : " + "; ".join(reasons))
+            res.warnings.append(tr("le QC aurait refusé : {reasons}", reasons="; ".join(reasons)))
         return res
     if item.source in ("local", "fallback"):
         # déjà une version locale : rien de mieux à proposer, on signale seulement
         res.decision = "local"
-        res.warnings += [f"contrôle : {r}" for r in reasons]
+        res.warnings += [tr("contrôle : {reason}", reason=r) for r in reasons]
         return res
 
     # structure trahie, motifs qui ne se rejoignent pas au raccord : pas de correctif honnête
@@ -373,10 +401,10 @@ def run_qc(item: QCItem, cfg: dict) -> QCResult:
         if auto_fix and (need_lock or strength_always > 0):
             s = float(q.get("color_lock", 1.0)) if need_lock else strength_always
             cur = color_lock(cur, item, s)
-            res.fixes.append(f"verrou couleur ×{s:.2f}" if need_lock else f"verrou couleur léger ×{s:.2f}")
+            res.fixes.append(tr("verrou couleur ×{v:.2f}", v=s) if need_lock else tr("verrou couleur léger ×{v:.2f}", v=s))
         if auto_fix and cur_fails.get("seam"):
             cur = fix_seam(cur, item, float(q.get("seam_band", 0.06)), float(q.get("seam_feather", 0.015)), baseline)
-            res.fixes.append("fondu du raccord")
+            res.fixes.append(tr("fondu du raccord"))
         if res.fixes:
             after = measure(item, cur, cfg, baseline, cache)
             after_fails, after_warns = judge(after, item, cfg)
@@ -386,7 +414,7 @@ def run_qc(item: QCItem, cfg: dict) -> QCResult:
                 res.warnings = notes + after_warns
                 return res
             fails = after_fails
-            res.reasons = reasons + [f"après correctif : {r}" for r in _flat(after_fails)]
+            res.reasons = reasons + [tr("après correctif : {reason}", reason=r) for r in _flat(after_fails)]
         elif not fails:
             return res
 
@@ -405,11 +433,11 @@ def summarize(m: dict) -> str:
         parts.append(f"ΔE {m['delta_e']:.1f}")
     seams = m.get("seam") or {}
     if seams:
-        parts.append("raccord " + "/".join(f"{max(v['full'], v['local']):.2f}" for v in seams.values()))
+        parts.append(tr("raccord {values}", values="/".join(f"{max(v['full'], v['local']):.2f}" for v in seams.values())))
     if m.get("detail_gain") is not None:
-        parts.append(f"détail ×{m['detail_gain']:.2f}")
+        parts.append(tr("détail ×{v:.2f}", v=m["detail_gain"]))
     return ", ".join(parts)
 
 
 __all__ = ["QCItem", "QCResult", "run_qc", "measure", "judge", "color_lock", "fix_seam", "to_target",
-           "summarize", "DECISIONS", "LABELS"]
+           "summarize", "DECISIONS", "LABELS", "label_of"]

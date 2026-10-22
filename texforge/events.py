@@ -16,103 +16,130 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, TextIO
 
+from .i18n import N_, tr
+
 EVENT_TYPES = (
     "run_start", "stage_start", "stage_end", "routed", "ui_done", "local_done", "comfy_queued", "comfy_progress",
     "comfy_done", "fallback", "retry", "failed", "gpu_free", "gpu_status", "server_down", "server_back",
     "stopped", "run_end", "info", "qc_start", "qc_done", "qc_end",
-    "pipeline_start", "pipeline_stage", "progress", "pipeline_end",
+    "pipeline_start", "pipeline_stage", "progress", "pipeline_end", "esrgan_done",
 )
 _QC_TAG = {"validated": "[QC] ✔", "corrected": "[QC] ✎", "rejected": "[QC] ✘", "local": "[QC] ·",
            "measured": "[QC] =", "error": "[QC] !"}
 
 
 def _fmt(rec: dict[str, Any]) -> str | None:
+    """Ligne lisible d'un événement, dans la langue active (les champs libres comme `message` arrivent
+    déjà dans la langue du processus qui les a produits)."""
     e = rec["event"]
     n = rec.get("name", "")
     pos = f" ({rec['index']}/{rec['total']})" if rec.get("total") and rec.get("index") else ""
     if e == "run_start":
-        return f"== TEXFORGE : {rec.get('total', 0)} texture(s) à traiter — moteur IA : {rec.get('provider', '?')}"
+        return tr("== TEXFORGE : {total} texture(s) à traiter — moteur IA : {provider}",
+                  total=rec.get("total", 0), provider=rec.get("provider", "?"))
     if e == "stage_start":
-        return f"── Étape {rec.get('stage', '').upper()} : {rec.get('count', 0)} texture(s)"
+        return tr("── Étape {stage} : {count} texture(s)", stage=rec.get("stage", "").upper(), count=rec.get("count", 0))
     if e == "stage_end":
-        return f"── Fin {rec.get('stage', '').upper()} : {rec.get('summary', '')}"
+        return tr("── Fin {stage} : {summary}", stage=rec.get("stage", "").upper(), summary=rec.get("summary", ""))
     if e == "routed":
-        return f"[ROUTE] {n} → {rec.get('route', '').upper()} ({rec.get('reason', '')})" if rec.get("verbose") else None
+        return (f"[ROUTE] {n} → {rec.get('route', '').upper()} ({rec.get('reason', '')})"
+                if rec.get("verbose") else None)
     if e == "ui_done":
-        return f"[UI] {n} traité localement ({rec.get('engine', '')}, ×{rec.get('k', '?')}){pos}"
+        return tr("[UI] {name} traité localement ({engine}, ×{k}){pos}", name=n, engine=rec.get("engine", ""),
+                  k=rec.get("k", "?"), pos=pos)
     if e == "local_done":
-        return f"[LOCAL] {n} agrandi ({rec.get('engine', 'lanczos')}, ×{rec.get('k', '?')}){pos}"
+        return tr("[LOCAL] {name} agrandi ({engine}, ×{k}){pos}", name=n, engine=rec.get("engine", "lanczos"),
+                  k=rec.get("k", "?"), pos=pos)
     if e == "comfy_queued":
-        return f"[COMFYUI] {n} en file{pos} — {rec.get('material', '')}, tiling {rec.get('tiling', '')}"
+        return tr("[COMFYUI] {name} en file{pos} — {material}, tiling {tiling}", name=n, pos=pos,
+                  material=rec.get("material", ""), tiling=rec.get("tiling", ""))
     if e == "comfy_done":
-        return (f"[COMFYUI] {n} validé{pos} — structure {rec.get('structure', '?')}, essai {rec.get('attempt', '?')}, "
-                f"{rec.get('seconds', 0):.1f} s")
+        return tr("[COMFYUI] {name} validé{pos} — structure {structure}, essai {attempt}, {seconds:.1f} s", name=n,
+                  pos=pos, structure=rec.get("structure", "?"), attempt=rec.get("attempt", "?"),
+                  seconds=float(rec.get("seconds", 0) or 0))
+    if e == "esrgan_done":
+        return tr("[ESRGAN] {name} agrandi ×{k} — {material}, part prudente {guard:.0%}, grain {grain:.1f}{pos}",
+                  name=n, k=rec.get("k", "?"), material=rec.get("material", ""),
+                  guard=float(rec.get("guard") or 0), grain=float(rec.get("grain") or 0), pos=pos)
     if e == "fallback":
-        return f"[REPLI] {n} → {rec.get('engine', '')} ({rec.get('reason', '')}){pos}"
+        return tr("[REPLI] {name} → {engine} ({reason}){pos}", name=n, engine=rec.get("engine", ""),
+                  reason=rec.get("reason", ""), pos=pos)
     if e == "retry":
-        return f"[RETRY] {n} : {rec.get('message', '')} — nouvel essai {rec.get('attempt', '')}"
+        return tr("[RETRY] {name} : {message} — nouvel essai {attempt}", name=n, message=rec.get("message", ""),
+                  attempt=rec.get("attempt", ""))
     if e == "failed":
-        return f"[ERREUR] {n} : {rec.get('message', '')} [{rec.get('kind', '')}]"
+        return tr("[ERREUR] {name} : {message} [{kind}]", name=n, message=rec.get("message", ""),
+                  kind=rec.get("kind", ""))
     if e == "gpu_free":
         free = rec.get("vram_free_gb")
-        return f"[GPU] VRAM libérée ({rec.get('reason', '')})" + (f" — libre avant : {free:.1f} Go" if free is not None else "")
+        return (tr("[GPU] VRAM libérée ({reason})", reason=rec.get("reason", ""))
+                + (tr(" — libre avant : {gb:.1f} Go", gb=free) if free is not None else ""))
     if e == "gpu_status":
         return None
     if e == "server_down":
-        return f"[COMFYUI] serveur injoignable — {rec.get('message', '')}"
+        return tr("[COMFYUI] serveur injoignable — {message}", message=rec.get("message", ""))
     if e == "server_back":
-        return "[COMFYUI] serveur de nouveau disponible"
+        return tr("[COMFYUI] serveur de nouveau disponible")
     if e == "stopped":
-        return f"■ Arrêt : {rec.get('message', '')}"
+        return tr("■ Arrêt : {message}", message=rec.get("message", ""))
     if e == "run_end":
-        return f"== Terminé en {rec.get('seconds', 0):.0f} s — {rec.get('summary', '')}"
+        return tr("== Terminé en {seconds:.0f} s — {summary}", seconds=float(rec.get("seconds", 0) or 0),
+                  summary=rec.get("summary", ""))
     if e == "info":
         return rec.get("message", "")
     if e == "progress":
         return None
     if e == "pipeline_start":
-        return (f"[INFO] Chaîne complète — entrée {rec.get('input', '')}\n"
-                f"[INFO] sortie {rec.get('output', '')} — moteur {rec.get('provider', '')}, modèle {rec.get('model', '')}, "
-                f"checkpoint {rec.get('checkpoint', '')}" + (f", LoRA {rec['lora']}" if rec.get("lora") else "")
-                + f"\n[INFO] projet : {rec.get('work', '')}")
+        lora = tr(", LoRA {lora}", lora=rec["lora"]) if rec.get("lora") else ""
+        return (tr("[INFO] Chaîne complète — entrée {input}", input=rec.get("input", "")) + "\n"
+                + tr("[INFO] sortie {output} — moteur {provider}, modèle {model}, checkpoint {checkpoint}",
+                     output=rec.get("output", ""), provider=rec.get("provider", ""), model=rec.get("model", ""),
+                     checkpoint=rec.get("checkpoint", ""))
+                + lora + "\n" + tr("[INFO] projet : {work}", work=rec.get("work", "")))
     if e == "pipeline_stage":
-        return f"══ ÉTAPE {rec.get('index', '?')}/{rec.get('total', '?')} : {rec.get('label', rec.get('stage', ''))}"
+        label = rec.get("label", rec.get("stage", ""))
+        return tr("══ ÉTAPE {index}/{total} : {label}", index=rec.get("index", "?"), total=rec.get("total", "?"),
+                  label=label)
     if e == "pipeline_end":
-        head = {"ok": "✔ Pipeline terminé", "errors": "⚠ Pipeline terminé avec des échecs",
-                "stopped": "■ Pipeline arrêté", "fatal": "✗ Pipeline interrompu"}.get(rec.get("status"), "Fin")
-        line = f"══ {head} en {rec.get('seconds', 0):.0f} s"
+        heads = {"ok": N_("✔ Pipeline terminé"), "errors": N_("⚠ Pipeline terminé avec des échecs"),
+                 "stopped": N_("■ Pipeline arrêté"), "fatal": N_("✗ Pipeline interrompu")}
+        head = tr(heads.get(rec.get("status"), N_("Fin")))
+        line = tr("══ {head} en {seconds:.0f} s", head=head, seconds=float(rec.get("seconds", 0) or 0))
         if rec.get("message"):
             line += f" — {rec['message']}"
         if rec.get("summary"):
             line += f"\n   {rec['summary']}"
         return line
     if e == "qc_start":
-        what = {"specialk": "DDS Special K", "png": "PNG", "remix": "PNG RTX Remix", "none": "sans export"}
-        return (f"== Contrôle qualité : {rec.get('total', 0)} texture(s) — {what.get(rec.get('target'), '?')}"
-                + (f", encodeur {rec['encoder']}" if rec.get("encoder") not in (None, "-") else "")
-                + ("" if rec.get("qc", True) else " (QC désactivé)"))
+        what = {"specialk": N_("DDS Special K"), "loose": N_("DDS en fichiers séparés"), "png": "PNG",
+                "remix": N_("PNG RTX Remix"), "none": N_("sans export")}
+        target = what.get(rec.get("target"), "?")
+        return (tr("== Contrôle qualité : {total} texture(s) — {target}", total=rec.get("total", 0), target=tr(target))
+                + (tr(", encodeur {encoder}", encoder=rec["encoder"]) if rec.get("encoder") not in (None, "-") else "")
+                + ("" if rec.get("qc", True) else tr(" (QC désactivé)")))
     if e == "qc_done":
         d = rec.get("decision", "")
         line = f"{_QC_TAG.get(d, '[QC]')} {n} {rec.get('label', d)}{pos}"
         if rec.get("summary"):
             line += f" — {rec['summary']}"
         if rec.get("format"):
-            line += f" → {rec['format']}, {rec.get('levels', 1)} mip(s)"
+            line += tr(" → {format}, {levels} mip(s)", format=rec["format"], levels=rec.get("levels", 1))
         if d == "corrected" and rec.get("fixes"):
-            line += f" | correctifs : {', '.join(rec['fixes'])}"
+            line += tr(" | correctifs : {fixes}", fixes=", ".join(rec["fixes"]))
         if d in ("rejected", "error") and rec.get("reasons"):
             line += f" | {'; '.join(rec['reasons'][:2])}"
             if d == "rejected":
-                line += " → version locale conservée"
+                line += tr(" → version locale conservée")
         if rec.get("warnings"):
             line += f" | ⚠ {'; '.join(rec['warnings'][:2])}"
         return line
     if e == "qc_end":
-        line = f"== QC terminé en {rec.get('seconds', 0):.0f} s — {rec.get('summary', '')}"
+        line = tr("== QC terminé en {seconds:.0f} s — {summary}", seconds=float(rec.get("seconds", 0) or 0),
+                  summary=rec.get("summary", ""))
         if rec.get("memory_warning"):
             line += f"\n⚠ {rec['memory_warning']}"
         if rec.get("report"):
-            line += f"\nRapport : {rec['report']}"
+            line += "\n" + tr("Rapport : {path}", path=rec["report"])
         return line
     return None
 

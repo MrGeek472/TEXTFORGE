@@ -4,5 +4,7 @@ aiohttp>=3.9
 tqdm>=4.66
 # Interface graphique (app_gui.py) ; « PySide6 » complet convient aussi
 PySide6-Essentials>=6.6
+# Archives BA2 de Starfield (compression LZ4) ; Fallout 4 n'en a pas besoin
+lz4>=4.0
 # Optionnel : fournisseur cloud Higgsfield (provider.name = "higgsfield")
 # higgsfield-client>=0.2.0

@@ -18,6 +18,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageFilter
 
+from .i18n import tr
 from .imaging import LANCZOS, parse_ratio
 
 
@@ -70,7 +71,7 @@ class MockProvider:
         return Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB"), f"mock://{rid}"
 
     def resume(self, request_id: str):
-        raise ProviderError("une requête mock ne peut pas être reprise")
+        raise ProviderError(tr("une requête mock ne peut pas être reprise"))
 
 
 class HiggsfieldProvider:
@@ -82,7 +83,7 @@ class HiggsfieldProvider:
             import higgsfield_client
             import httpx
         except ImportError as exc:
-            raise FatalError("le paquet higgsfield-client n'est pas installé : pip install -r requirements.txt") from exc
+            raise FatalError(tr("le paquet higgsfield-client n'est pas installé : pip install -r requirements.txt")) from exc
         self._hf = higgsfield_client
         self._httpx = httpx
         self.cfg = cfg
@@ -97,8 +98,8 @@ class HiggsfieldProvider:
                 key = f"{os.getenv('HF_API_KEY')}:{os.getenv('HF_API_SECRET')}"
         if not key or ":" not in key:
             raise FatalError(
-                "clé Higgsfield absente. Crée une clé sur console.higgsfield.ai puis définis la variable "
-                "d'environnement HF_KEY=\"id:secret\" (ou HF_API_KEY et HF_API_SECRET).")
+                tr("clé Higgsfield absente. Crée une clé sur console.higgsfield.ai puis définis la variable "
+                "d'environnement HF_KEY=\"id:secret\" (ou HF_API_KEY et HF_API_SECRET)."))
         self.client = higgsfield_client.SyncClient(api_key=key, timeout=120.0)
         self.model = self.hcfg["model"]
 
@@ -108,12 +109,12 @@ class HiggsfieldProvider:
         code = getattr(getattr(cause, "response", None), "status_code", None)
         msg = str(exc) or exc.__class__.__name__
         if code in (401, 403):
-            return FatalError(f"accès refusé par Higgsfield ({code}) : {msg}")
+            return FatalError(tr("accès refusé par Higgsfield ({code}) : {msg}", code=code, msg=msg))
         if code == 402 or "credit" in msg.lower() or "balance" in msg.lower():
-            return FatalError(f"crédits insuffisants ({code}) : {msg}")
+            return FatalError(tr("crédits insuffisants ({code}) : {msg}", code=code, msg=msg))
         if code in (400, 404, 422):
-            return ProviderError(f"requête refusée ({code}) : {msg}")
-        return TransientError(f"erreur Higgsfield ({code}) : {msg}")
+            return ProviderError(tr("requête refusée ({code}) : {msg}", code=code, msg=msg))
+        return TransientError(tr("erreur Higgsfield ({code}) : {msg}", code=code, msg=msg))
 
     # ------------------------------------------------------------ envois
     def _upload_bytes(self, data: bytes, content_type: str) -> str:
@@ -126,7 +127,7 @@ class HiggsfieldProvider:
         except self._hf.HiggsfieldClientError as exc:
             raise self._classify(exc) from exc
         except self._httpx.TransportError as exc:
-            raise TransientError(f"envoi impossible : {exc}") from exc
+            raise TransientError(tr("envoi impossible : {exc}", exc=exc)) from exc
         if self.state:
             self.state.put_upload(sha, url)
         return url
@@ -162,7 +163,7 @@ class HiggsfieldProvider:
         except self._hf.HiggsfieldClientError as exc:
             raise self._classify(exc) from exc
         except self._httpx.TransportError as exc:
-            raise TransientError(f"soumission impossible : {exc}") from exc
+            raise TransientError(tr("soumission impossible : {exc}", exc=exc)) from exc
         on_submitted(controller.request_id)
         return self._wait(controller)
 
@@ -184,33 +185,33 @@ class HiggsfieldProvider:
             except self._httpx.TransportError as exc:
                 net_errors += 1
                 if net_errors >= 5:
-                    raise TransientError(f"réseau indisponible pendant l'attente : {exc}") from exc
+                    raise TransientError(tr("réseau indisponible pendant l'attente : {exc}", exc=exc)) from exc
                 time.sleep(interval * net_errors)
                 continue
             if isinstance(st, hf.Completed):
                 break
             if isinstance(st, hf.NSFW):
-                raise ProviderError("résultat bloqué par le filtre de contenu (NSFW)")
+                raise ProviderError(tr("résultat bloqué par le filtre de contenu (NSFW)"))
             if isinstance(st, (hf.Failed, hf.Cancelled)):
-                raise ProviderError(f"génération en échec ({st.__class__.__name__})")
+                raise ProviderError(tr("génération en échec ({name})", name=st.__class__.__name__))
             if time.time() > deadline:
-                raise TransientError("délai dépassé ; la requête sera reprise au prochain lancement")
+                raise TransientError(tr("délai dépassé ; la requête sera reprise au prochain lancement"))
             time.sleep(interval)
         try:
             data = controller.get()
         except hf.HiggsfieldClientError as exc:
             raise self._classify(exc) from exc
         except self._httpx.TransportError as exc:
-            raise TransientError(f"lecture du résultat impossible : {exc}") from exc
+            raise TransientError(tr("lecture du résultat impossible : {exc}", exc=exc)) from exc
         images = data.get("images") or []
         if not images or not images[0].get("url"):
-            raise ProviderError(f"réponse sans image : {str(data)[:200]}")
+            raise ProviderError(tr("réponse sans image : {data}", data=str(data)[:200]))
         url = images[0]["url"]
         try:
             r = self._httpx.get(url, timeout=180.0, follow_redirects=True)
             r.raise_for_status()
         except Exception as exc:
-            raise TransientError(f"téléchargement du résultat impossible : {exc}") from exc
+            raise TransientError(tr("téléchargement du résultat impossible : {exc}", exc=exc)) from exc
         img = Image.open(io.BytesIO(r.content))
         img.load()
         return img.convert("RGB"), url
@@ -264,7 +265,7 @@ class ComfyUIProvider:
             self.wf_edges = (customize_workflow(chc.ComfyWorkflow.from_file(
                 resolve_workflow_path(cfg, edges_raw)), self.c, chc) if edges_raw else None)
         except chc.WorkflowError as exc:
-            raise WorkflowFatal(f"workflow ComfyUI invalide : {exc}") from exc
+            raise WorkflowFatal(tr("workflow ComfyUI invalide : {exc}", exc=exc)) from exc
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name="comfyui-loop", daemon=True)
         self.thread.start()
@@ -327,7 +328,7 @@ class ComfyUIProvider:
         except self.chc.WorkflowError:
             if title not in self._warned:
                 self._warned.add(title)
-                print(f"  ! nœud {title} absent du workflow : réglage ignoré", file=sys.stderr)
+                print(tr("  ! nœud {title} absent du workflow : réglage ignoré", title=title), file=sys.stderr)
             return False
 
     def build_context(self, rec: dict, an) -> dict:
@@ -375,13 +376,13 @@ class ComfyUIProvider:
                 raise TransientError(f"[{exc.kind}] {exc}") from exc
             raise ProviderError(f"[{exc.kind}] {exc}") from exc
         except TimeoutError as exc:
-            raise TransientError(f"[timeout] pas de réponse de la boucle ComfyUI : {exc}") from exc
+            raise TransientError(tr("[timeout] pas de réponse de la boucle ComfyUI : {exc}", exc=exc)) from exc
         img = Image.open(io.BytesIO(blobs[0]))
         img.load()
         return img.convert("RGB"), f"comfyui://{ctx.get('stem', 'texture')}"
 
     def resume(self, request_id: str):
-        raise ProviderError("les requêtes locales ne se reprennent pas")
+        raise ProviderError(tr("les requêtes locales ne se reprennent pas"))
 
 
 def customize_workflow(wf, c: dict, chc):
@@ -403,12 +404,12 @@ def customize_workflow(wf, c: dict, chc):
     ck = by_title("TEXFORGE_CHECKPOINT", ("CheckpointLoaderSimple", "CheckpointLoader"))
     if ckpt:
         if ck is None:
-            raise chc.WorkflowError("checkpoint choisi mais aucun nœud TEXFORGE_CHECKPOINT unique dans le workflow")
+            raise chc.WorkflowError(tr("checkpoint choisi mais aucun nœud TEXFORGE_CHECKPOINT unique dans le workflow"))
         graph[ck]["inputs"]["ckpt_name"] = ckpt
     if cn:
         cid = by_title("TEXFORGE_CN_TILE_MODEL", ("ControlNetLoader",))
         if cid is None:
-            raise chc.WorkflowError("modèle ControlNet choisi mais aucun nœud TEXFORGE_CN_TILE_MODEL unique")
+            raise chc.WorkflowError(tr("modèle ControlNet choisi mais aucun nœud TEXFORGE_CN_TILE_MODEL unique"))
         graph[cid]["inputs"]["control_net_name"] = cn
     if lora:
         strength = float(c.get("lora_strength", 0.8))
@@ -417,7 +418,7 @@ def customize_workflow(wf, c: dict, chc):
             graph[existing]["inputs"].update(lora_name=lora, strength_model=strength, strength_clip=strength)
         else:
             if ck is None:
-                raise chc.WorkflowError("LoRA choisie mais aucun nœud TEXFORGE_CHECKPOINT unique pour l'insérer")
+                raise chc.WorkflowError(tr("LoRA choisie mais aucun nœud TEXFORGE_CHECKPOINT unique pour l'insérer"))
             numeric = [int(n) for n in graph if str(n).isdigit()]
             lid = str(max(numeric, default=0) + 1)
             for node in graph.values():
@@ -438,4 +439,4 @@ def make_provider(cfg: dict, state, name: str | None = None, **kwargs):
         return ComfyUIProvider(cfg, state, **kwargs)
     if name == "higgsfield":
         return HiggsfieldProvider(cfg, state)
-    raise FatalError(f"fournisseur inconnu : {name} (attendu : comfyui, mock ou higgsfield)")
+    raise FatalError(tr("fournisseur inconnu : {name} (attendu : comfyui, esrgan, mock ou higgsfield)", name=name))

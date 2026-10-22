@@ -35,6 +35,7 @@ from pathlib import Path
 
 from .config import DEFAULTS, load_config
 from .events import EventBus
+from .i18n import N_, tr
 
 ROOT = Path(__file__).resolve().parent.parent
 FAMILIES = {
@@ -43,8 +44,8 @@ FAMILIES = {
     "sd15": ("workflows/texforge_sd15_tile_api.json", ""),
 }
 STAGES = ("scan", "generate", "export")
-STAGE_LABELS = {"scan": "Scan et routage", "generate": "Génération (UI, local, ComfyUI)",
-                "export": "Contrôle qualité et export DDS"}
+STAGE_LABELS = {"scan": N_("Scan et routage"), "generate": N_("Génération (UI, local, ComfyUI)"),
+                "export": N_("Contrôle qualité et export DDS")}          # tr(STAGE_LABELS[…]) à l'affichage
 EXIT_OK, EXIT_ERRORS, EXIT_FATAL, EXIT_STOPPED = 0, 1, 2, 3
 
 
@@ -55,9 +56,9 @@ class RemasterSettings:
     input_dir: str = ""
     output_dir: str = ""
     work_dir: str = ""              # vide : dossier de projet par défaut (données locales de l'utilisateur)
-    target: str = "specialk"        # specialk (DDS) | remix (PNG RTX Remix) | png
+    target: str = "specialk"        # specialk (DDS) | loose (DDS, chemins conservés : Bethesda, mods) | remix | png
     # moteur IA
-    provider: str = "comfyui"       # comfyui | mock (simulation sans GPU)
+    provider: str = "comfyui"       # comfyui | esrgan (sans ComfyUI : Real-ESRGAN réaliste) | mock (simulation)
     server: str = "http://127.0.0.1:8188"
     model_family: str = "sdxl"      # sdxl | sd15 | custom
     workflow: str = ""              # famille custom : workflow au format API
@@ -85,6 +86,9 @@ class RemasterSettings:
     encoder: str = "auto"           # auto | texconv | builtin
     texconv_exe: str = ""
     realesrgan_exe: str = ""
+    esrgan_detail: float = 1.0      # mode esrgan : micro-détail (0 = aucun grain ajouté, 1 = dose mesurée)
+    # archives BA2 (Fallout 4, Starfield) : textures extraites, motifs séparés par « ; » (vide : toutes)
+    ba2_filter: str = "*_d.dds"
 
     @classmethod
     def from_dict(cls, d: dict) -> "RemasterSettings":
@@ -97,17 +101,28 @@ class RemasterSettings:
     def validate(self) -> list[str]:
         errs = []
         if not self.input_dir or not Path(self.input_dir).is_dir():
-            errs.append(f"dossier d'entrée introuvable : {self.input_dir or '(vide)'}")
+            errs.append(tr("dossier d'entrée introuvable : {path}", path=self.input_dir or tr("(vide)")))
         if not self.output_dir:
-            errs.append("dossier de sortie non renseigné")
+            errs.append(tr("dossier de sortie non renseigné"))
         elif Path(self.input_dir).resolve() == Path(self.output_dir).resolve():
-            errs.append("le dossier de sortie doit être différent du dossier d'entrée")
+            errs.append(tr("le dossier de sortie doit être différent du dossier d'entrée"))
         if self.model_family == "custom" and not Path(self.workflow).is_file():
-            errs.append(f"workflow personnalisé introuvable : {self.workflow or '(vide)'}")
+            errs.append(tr("workflow personnalisé introuvable : {path}", path=self.workflow or tr("(vide)")))
         if self.model_family not in (*FAMILIES, "custom"):
-            errs.append(f"famille de modèle inconnue : {self.model_family}")
+            errs.append(tr("famille de modèle inconnue : {family}", family=self.model_family))
+        if self.provider not in ("comfyui", "esrgan", "mock"):
+            errs.append(tr("moteur inconnu : {name}", name=self.provider))
+        if self.target not in ("specialk", "loose", "remix", "png"):
+            errs.append(tr("cible inconnue : {target}", target=self.target))
         if self.dds_format not in ("match", "auto", "dxt1", "dxt5", "bc7", "bgra8"):
-            errs.append(f"format DDS inconnu : {self.dds_format}")
+            errs.append(tr("format DDS inconnu : {fmt}", fmt=self.dds_format))
+        # ces outils sont lancés des centaines de fois : jamais un autre programme (l'exe du jeu…)
+        if self.texconv_exe and not Path(self.texconv_exe).stem.lower().startswith("texconv"):
+            errs.append(tr("le champ texconv désigne « {name} », pas texconv.exe : vide-le ou choisis texconv.exe",
+                           name=Path(self.texconv_exe).name))
+        if self.realesrgan_exe and "realesrgan" not in Path(self.realesrgan_exe).stem.lower():
+            errs.append(tr("le champ Real-ESRGAN désigne « {name} », pas realesrgan-ncnn-vulkan.exe",
+                           name=Path(self.realesrgan_exe).name))
         return errs
 
 
@@ -119,8 +134,18 @@ def default_work_dir(input_dir: str) -> Path:
     else:
         base = Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local" / "share") / "texforge"
     src = str(Path(input_dir).resolve()) if input_dir else "sans-dossier"
-    slug = re.sub(r"[^A-Za-z0-9._-]+", "_", Path(src).name or "projet")[:40]
-    return base / "projets" / f"{slug}-{hashlib.sha1(src.lower().encode()).hexdigest()[:8]}"
+    digest = hashlib.sha1(src.lower().encode()).hexdigest()[:8]
+    projects = base / "projets"
+    legacy = projects / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', Path(src).name or 'projet')[:40]}-{digest}"
+    if legacy.is_dir():                     # projet existant : on le garde (état, résultats, reprise)
+        return legacy
+    # dump Special K / capture Remix : le dossier s'appelle toujours « textures », on nomme d'après le jeu
+    from .detect import game_dir_of, game_name
+    game = game_dir_of(src)
+    name = game_name(game / "x") if game is not None else Path(src).name
+    if game is None and Path(src).name.lower() == "data":       # Fallout 4, Starfield… : nommé d'après le jeu
+        name = Path(src).parent.name or name
+    return projects / f"{re.sub(r'[^A-Za-z0-9._-]+', '_', name or 'projet')[:40]}-{digest}"
 
 
 def work_dir_of(s: RemasterSettings) -> Path:
@@ -190,6 +215,7 @@ def write_project_config(s: RemasterSettings) -> Path:
     else:
         wf, wf_edges = FAMILIES[s.model_family]
     bc7 = s.dds_format == "bc7"
+    d3d11 = bc7 or s.target == "loose"          # Fallout 4 et Starfield : Direct3D 11, BC7 lisible
     sections = {
         "paths": {"inputs": [str(Path(s.input_dir).resolve())], "work": "./work"},
         "output": {"scale": int(s.scale), "max_side": int(s.max_side), "dds_format": s.dds_format,
@@ -201,8 +227,10 @@ def write_project_config(s: RemasterSettings) -> Path:
         "routing": {"enabled": bool(s.route_ui)},
         "ui_upscale": {"realesrgan_exe": s.realesrgan_exe},
         "local": {"esrgan_exe": s.realesrgan_exe},
+        "esrgan": {"detail": float(s.esrgan_detail)},
         "qc": {"enabled": bool(s.qc), "auto_fix": bool(s.qc_autofix), "encoder": s.encoder,
-               "texconv_exe": s.texconv_exe, "target_api": "d3d11" if bc7 else "d3d9", "allow_bc7": bc7},
+               "texconv_exe": s.texconv_exe, "target_api": "d3d11" if d3d11 else "d3d9", "allow_bc7": d3d11},
+        "ba2": {"filter": s.ba2_filter},
         "materials": material_presets(s),
     }
     rules = []
@@ -243,10 +271,10 @@ class ProgressBus(EventBus):
     def emit(self, event: str, **data) -> None:
         super().emit(event, **data)
         if event == "failed" and data.get("kind") == "workflow" and self.fatal is None:
-            self.fatal = str(data.get("message", "workflow refusé"))
+            self.fatal = str(data.get("message", tr("workflow refusé")))
         if event == "run_start":
             self.total, self.done, self.t_stage = int(data.get("total", 0)), 0, time.monotonic()
-        elif event in ("ui_done", "local_done", "comfy_done", "fallback") or \
+        elif event in ("ui_done", "local_done", "comfy_done", "esrgan_done", "fallback") or \
                 (event == "failed" and self.stage == "generate"):
             self.done += 1
         elif event == "qc_start":
@@ -283,6 +311,7 @@ class _Stopped(Exception):
 # ------------------------------------------------------------------ chaîne complète
 
 def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
+    from .ba2 import Ba2Error, data_folder, extract_textures
     from .ddsbuild import EncoderError
     from .orchestrator import Orchestrator
     from .pipeline import open_state, scan
@@ -301,11 +330,15 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
             bus.finish()
         parts = []
         if gen:
-            parts.append(f"{gen.get('ui', 0)} UI, {gen.get('local', 0)} local, {gen.get('ai', 0)} ComfyUI, "
-                         f"{gen.get('fallback', 0)} replis, {gen.get('errors', 0)} échecs")
+            parts.append(tr("{ui} UI, {local} local, {ai} {engine}, {fallback} replis, {errors} échecs",
+                            ui=gen.get("ui", 0), local=gen.get("local", 0), ai=gen.get("ai", 0),
+                            engine="Real-ESRGAN" if s.provider == "esrgan" else "ComfyUI" if s.provider == "comfyui"
+                            else tr("simulation"), fallback=gen.get("fallback", 0), errors=gen.get("errors", 0)))
         if qc_sum:
-            parts.append(f"QC : {qc_sum.get('validated', 0)} validées, {qc_sum.get('corrected', 0)} corrigées, "
-                         f"{qc_sum.get('rejected', 0)} rejetées — {qc_sum.get('written', 0)} fichier(s) écrit(s)")
+            parts.append(tr("QC : {validated} validées, {corrected} corrigées, {rejected} rejetées — "
+                            "{written} fichier(s) écrit(s)", validated=qc_sum.get("validated", 0),
+                            corrected=qc_sum.get("corrected", 0), rejected=qc_sum.get("rejected", 0),
+                            written=qc_sum.get("written", 0)))
         bus.emit("pipeline_end", code=code, status=status, message=message, summary=" | ".join(parts),
                  generation=gen, qc=qc_sum, report=qc_sum.get("report"), output=str(Path(s.output_dir).resolve()),
                  work=str(work_dir_of(s)), seconds=round(time.monotonic() - t0, 1))
@@ -315,14 +348,38 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
             pass
         return code
 
-    family = s.model_family if s.model_family != "custom" else f"personnalisé ({Path(s.workflow).name})"
+    family = s.model_family if s.model_family != "custom" else tr("personnalisé ({name})", name=Path(s.workflow).name)
+    checkpoint = s.checkpoint or "(workflow)"
+    if s.provider == "esrgan":
+        family, checkpoint = "realesrgan-x4plus + realesr-animevideov3", "—"
     bus.emit("pipeline_start", input=str(Path(s.input_dir).resolve()), output=str(Path(s.output_dir).resolve()),
-             work=str(work_dir_of(s)), provider=s.provider, model=family, checkpoint=s.checkpoint or "(workflow)",
+             work=str(work_dir_of(s)), provider=s.provider, model=family, checkpoint=checkpoint,
              lora=s.lora or "", config=str(Path(cfg["_base"]) / "texforge.toml"))
 
     # 1. scan et routage
     bus.set_stage("scan")
-    bus.emit("pipeline_stage", stage="scan", index=1, total=len(STAGES), label=STAGE_LABELS["scan"])
+    bus.emit("pipeline_stage", stage="scan", index=1, total=len(STAGES), label=tr(STAGE_LABELS["scan"]))
+    ba2_dir = data_folder(s.input_dir)
+    if ba2_dir is not None:
+        # Fallout 4, Starfield : textures lues dans les archives BA2 (les fichiers séparés ne sont pas repris)
+        dest = work_dir_of(s) / "ba2"            # hors de work/ : le scan ignore ce que TEXFORGE y produit
+        bus.emit("info", message=tr("[BA2] archives de textures dans {path} — filtre : {filter}", path=ba2_dir,
+                                    filter=s.ba2_filter or tr("toutes")))
+        try:
+            ex = extract_textures(ba2_dir, dest, include=s.ba2_filter, scale=s.scale, max_side=s.max_side,
+                                  limit=s.limit, log=lambda m: bus.emit("info", message=m),
+                                  on_progress=lambda i, n: bus.scan_progress(i, n))
+        except (Ba2Error, OSError) as exc:
+            bus.emit("failed", name="pipeline", stage="scan", kind="fatal", message=str(exc))
+            return end(EXIT_FATAL, str(exc))
+        bus.emit("info", message=tr("[BA2] {selected} texture(s) à traiter sur {listed} ({matched} selon le filtre ; "
+                                    "{maxed} déjà à la taille maximale, {loose} remplacées par un fichier séparé, "
+                                    "{cubemaps} cubemap(s) ignorées) — {written} extraite(s), {kept} déjà là",
+                                    **ex))
+        if not ex["selected"]:
+            return end(EXIT_FATAL, tr("aucune texture des archives BA2 ne correspond au filtre « {filter} »",
+                                      filter=s.ba2_filter))
+        cfg["_inputs"] = [str(dest)]
 
     def on_scan(i: int, n: int, name: str) -> None:
         if stop_file.exists():
@@ -332,19 +389,26 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     try:
         counts = scan(cfg, log=lambda m: bus.emit("info", message=f"[INFO] {m.strip()}"), on_progress=on_scan)
     except _Stopped:
-        bus.emit("stopped", message="arrêt demandé pendant le scan")
+        bus.emit("stopped", message=tr("arrêt demandé pendant le scan"))
         return end(EXIT_STOPPED)
-    routes = ", ".join(f"{counts.get('route_' + r, 0)} {lbl}" for r, lbl in
-                       (("ui", "UI"), ("comfyui", "ComfyUI"), ("local", "local"), ("keep", "gardées")))
-    bus.emit("info", message=f"[INFO] {counts.get('seen', 0)} texture(s) analysée(s) — {counts['new']} nouvelle(s), "
-                             f"{counts['changed']} modifiée(s), {counts['errors']} illisible(s) — routage : {routes}")
+    routes = ", ".join(f"{counts.get('route_' + r, 0)} {tr(lbl)}" for r, lbl in
+                       (("ui", "UI"), ("comfyui", "ComfyUI"), ("local", N_("local")), ("keep", N_("gardées"))))
+    bus.emit("info", message=tr("[INFO] {seen} texture(s) analysée(s) — {new} nouvelle(s), {changed} modifiée(s), "
+                                "{errors} illisible(s) — routage : {routes}", seen=counts.get("seen", 0),
+                                new=counts["new"], changed=counts["changed"], errors=counts["errors"], routes=routes))
+    if counts.get("seen", 0) == 0:
+        # rien à traiter : ne pas annoncer un succès ni écrire un rapport vide dans le dossier de sortie
+        from .detect import check_input, empty_input_help
+        why = empty_input_help(s.input_dir, check_input(s.input_dir, stop_at_image=False))
+        bus.emit("failed", name="pipeline", stage="scan", kind="fatal", message=why)
+        return end(EXIT_FATAL, tr("aucune texture à traiter dans le dossier d'entrée"))
 
     # 2. génération
     if stop_file.exists():
-        bus.emit("stopped", message="arrêt demandé avant la génération")
+        bus.emit("stopped", message=tr("arrêt demandé avant la génération"))
         return end(EXIT_STOPPED)
     bus.set_stage("generate")
-    bus.emit("pipeline_stage", stage="generate", index=2, total=len(STAGES), label=STAGE_LABELS["generate"])
+    bus.emit("pipeline_stage", stage="generate", index=2, total=len(STAGES), label=tr(STAGE_LABELS["generate"]))
     orch = Orchestrator(cfg, bus, provider_name=s.provider)
     try:
         gen = orch.run(limit=s.limit or None, redo_stale=s.redo_stale)
@@ -353,14 +417,14 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
         return end(EXIT_FATAL, str(exc))
     if bus.fatal:
         # nœud ou modèle absent côté ComfyUI : exporter d'anciens résultats induirait en erreur
-        return end(EXIT_FATAL, f"workflow refusé par ComfyUI ({bus.fatal.splitlines()[0][:160]}) — vérifie le "
-                               f"checkpoint, la LoRA et les nœuds personnalisés, puis relance")
+        return end(EXIT_FATAL, tr("workflow refusé par ComfyUI ({why}) — vérifie le checkpoint, la LoRA et les "
+                                  "nœuds personnalisés, puis relance", why=bus.fatal.splitlines()[0][:160]))
     if orch.runner.stop.is_set():
         return end(EXIT_STOPPED)
 
     # 3. contrôle qualité et export
     bus.set_stage("export")
-    bus.emit("pipeline_stage", stage="export", index=3, total=len(STAGES), label=STAGE_LABELS["export"])
+    bus.emit("pipeline_stage", stage="export", index=3, total=len(STAGES), label=tr(STAGE_LABELS["export"]))
     out_dir = Path(s.output_dir).resolve()
     out_dir.mkdir(parents=True, exist_ok=True)
     state = open_state(cfg)
@@ -377,6 +441,8 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     if qc_sum.get("stopped"):
         return end(EXIT_STOPPED)
     failed = gen.get("errors", 0) + qc_sum.get("error", 0)
+    if gen.get("server_unreachable"):          # rien n'est passé par ComfyUI : ne pas afficher un succès
+        return end(EXIT_ERRORS, tr("ComfyUI injoignable : matières agrandies sans IA générative"))
     return end(EXIT_ERRORS if failed else EXIT_OK)
 
 
@@ -388,18 +454,38 @@ def main(argv: list[str]) -> int:
     p.add_argument("--settings", help="fichier de réglages JSON (écrit par l'interface graphique)")
     p.add_argument("--input", help="dossier des textures extraites (remplace celui des réglages)")
     p.add_argument("--output", help="dossier de sortie DDS (remplace celui des réglages)")
-    p.add_argument("--provider", choices=["comfyui", "mock"])
+    p.add_argument("--provider", choices=["comfyui", "esrgan", "mock"])
+    p.add_argument("--target", choices=["specialk", "loose", "remix", "png"])
+    p.add_argument("--ba2-filter", help="archives BA2 : textures à extraire (motifs séparés par « ; », vide : toutes)")
     p.add_argument("--json-events", action="store_true", help="un événement JSON par ligne sur la sortie standard")
     p.add_argument("--quiet", action="store_true")
     a = p.parse_args(argv)
     data = json.loads(Path(a.settings).read_text(encoding="utf-8")) if a.settings else {}
     s = RemasterSettings.from_dict(data)
     if a.input:
-        s.input_dir = a.input
+        # comme dans l'interface : dossier d'un jeu -> son dump Special K, son profil SKIF, ses textures
+        from .detect import locate_textures
+        loc = locate_textures(a.input)
+        s.input_dir = loc.path if loc.kind != "none" else a.input
+        if loc.changed and loc.kind != "none":
+            print(tr("[INFO] Dossier de textures : {path} ({count} fichier(s))", path=loc.path, count=loc.count),
+                  file=sys.stderr)
+        if loc.inject and not a.output and not s.output_dir:
+            s.output_dir = loc.inject
+        if loc.kind == "ba2":
+            from .ba2 import mod_output_for
+            if not a.target:
+                s.target = "loose"
+            if not a.output and not s.output_dir:
+                s.output_dir = str(mod_output_for(loc.path))
     if a.output:
         s.output_dir = a.output
     if a.provider:
         s.provider = a.provider
+    if a.target:
+        s.target = a.target
+    if a.ba2_filter is not None:
+        s.ba2_filter = a.ba2_filter
     errs = s.validate()
     if errs:
         for e in errs:

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from PIL import Image
 
+from .i18n import N_, get_lang, tr
 from .imaging import load_texture, thumbnail
 from .pipeline import open_state, safe_name
 
@@ -40,15 +41,33 @@ def build_review(cfg: dict) -> Path:
         cards.append(entry)
     state.close()
     page = out_dir / "index.html"
-    page.write_text(_HTML.replace("__DATA__", json.dumps(cards, ensure_ascii=False).replace("</", "<\\/")),
-                    encoding="utf-8")
+    page.write_text(render_page(cards), encoding="utf-8")
     return page
 
 
+# textes de la page, traduits à la génération : [[texte]] dans le HTML, t('texte') dans le script
+_TEXTS = [N_("TEXFORGE — Revue"), N_("TEXFORGE · revue"), N_("Toutes"), N_("Validées"), N_("Replis locaux"),
+          N_("Erreurs"), N_("Exporter mes choix (JSON)"), N_("Validée"), N_("Repli local"), N_("Erreur"),
+          N_("Original"), N_("Final"), N_("Agrandie localement"), N_("structure"), N_("décalage"), N_("raccord"),
+          N_("essai"), N_("IA"), N_("Local"), N_("local"), N_("auto"), N_("Garder le choix actuel"),
+          N_("Utiliser la version IA"), N_("Utiliser la version locale"), N_("Regénérer (nouvelle requête payante)"),
+          N_("texture(s)"), N_("choix modifié(s)")]
+
+
+def render_page(cards: list[dict]) -> str:
+    import html
+    import re
+    texts = {t: tr(t) for t in _TEXTS}
+    page = re.sub(r"\[\[(.+?)\]\]", lambda m: html.escape(texts.get(m.group(1), m.group(1))), _HTML)
+    page = page.replace("__LANG__", get_lang())
+    page = page.replace("__T__", json.dumps(texts, ensure_ascii=False).replace("</", "<\\/"))
+    return page.replace("__DATA__", json.dumps(cards, ensure_ascii=False).replace("</", "<\\/"))
+
+
 _HTML = """<!doctype html>
-<html lang="fr"><head><meta charset="utf-8">
+<html lang="__LANG__"><head><meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>TEXFORGE — Revue</title>
+<title>[[TEXFORGE — Revue]]</title>
 <style>
 :root{--bg:#121316;--panel:#1b1d22;--line:#2b2e36;--ink:#e8e9ec;--mute:#9298a5;--ok:#5fc48a;--warn:#e0a84f;--bad:#e06a5f;--acc:#7aa2ff}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--ink);font:14px/1.45 system-ui,Segoe UI,sans-serif}
@@ -83,20 +102,22 @@ select{width:100%;background:#111317;color:var(--ink);border:1px solid var(--lin
 @media (max-width:600px){main{grid-template-columns:1fr;padding:12px}}
 </style></head><body>
 <header>
-  <h1>TEXFORGE · revue</h1>
-  <span class="chip on" data-f="all">Toutes</span>
-  <span class="chip" data-f="done">Validées</span>
-  <span class="chip" data-f="fallback">Replis locaux</span>
-  <span class="chip" data-f="error">Erreurs</span>
+  <h1>[[TEXFORGE · revue]]</h1>
+  <span class="chip on" data-f="all">[[Toutes]]</span>
+  <span class="chip" data-f="done">[[Validées]]</span>
+  <span class="chip" data-f="fallback">[[Replis locaux]]</span>
+  <span class="chip" data-f="error">[[Erreurs]]</span>
   <span class="spacer"></span><span id="count"></span>
-  <button class="main" id="save">Exporter mes choix (JSON)</button>
+  <button class="main" id="save">[[Exporter mes choix (JSON)]]</button>
 </header>
 <main id="grid"></main>
 <script>
 const DATA = __DATA__;
+const T = __T__;
+const t = s => T[s] || s;
 const choices = {};
 let filter = 'all';
-const LABEL = {done:'Validée',fallback:'Repli local',error:'Erreur'};
+const LABEL = {done:t('Validée'),fallback:t('Repli local'),error:t('Erreur')};
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function card(d){
   const m=d.metrics||{};
@@ -106,27 +127,27 @@ function card(d){
    <div class="cmp" style="--cut:50%">
      ${d.imgs.original?`<img class="orig" src="${d.imgs.original}" alt="">`:''}
      ${right?`<img class="top" src="${right}" alt="">`:''}
-     <div class="bar"></div><span class="lab l">Original</span><span class="lab r rl">Final</span>
+     <div class="bar"></div><span class="lab l">${esc(t('Original'))}</span><span class="lab r rl">${esc(t('Final'))}</span>
    </div>
    <div class="body">
      <div class="name">${esc(d.name)}</div>
-     <div class="meta"><span class="badge b-${d.status}">${d.mode==='upscale'&&d.status==='done'?'Agrandie localement':(LABEL[d.status]||d.status)}</span>
+     <div class="meta"><span class="badge b-${d.status}">${esc(d.mode==='upscale'&&d.status==='done'?t('Agrandie localement'):(LABEL[d.status]||d.status))}</span>
        <span>${esc(d.fmt)} · ${d.w}×${d.h}</span>
-       ${m.structure!=null?`<span>structure ${m.structure}</span>`:''}
-       ${m.shift!=null?`<span>décalage ${m.shift}</span>`:''}
-       ${m.seam!=null?`<span>raccord ${m.seam}</span>`:''}
-       ${m.attempt?`<span>essai ${m.attempt}</span>`:''}</div>
+       ${m.structure!=null?`<span>${esc(t('structure'))} ${m.structure}</span>`:''}
+       ${m.shift!=null?`<span>${esc(t('décalage'))} ${m.shift}</span>`:''}
+       ${m.seam!=null?`<span>${esc(t('raccord'))} ${m.seam}</span>`:''}
+       ${m.attempt?`<span>${esc(t('essai'))} ${m.attempt}</span>`:''}</div>
      ${d.error?`<div class="err">${esc(d.error)}</div>`:''}
      <div class="views">
-       <button data-v="final" ${d.imgs.final?'':'disabled'}>Final</button>
-       <button data-v="ai" ${d.imgs.ai?'':'disabled'}>IA</button>
-       <button data-v="local" ${d.imgs.local?'':'disabled'}>Local</button>
+       <button data-v="final" ${d.imgs.final?'':'disabled'}>${esc(t('Final'))}</button>
+       <button data-v="ai" ${d.imgs.ai?'':'disabled'}>${esc(t('IA'))}</button>
+       <button data-v="local" ${d.imgs.local?'':'disabled'}>${esc(t('Local'))}</button>
      </div>
      <select>
-       <option value="">Garder le choix actuel (${d.choice==='ai'?'IA':d.choice==='local'?'local':'auto'})</option>
-       <option value="ai" ${d.imgs.ai?'':'disabled'}>Utiliser la version IA</option>
-       <option value="local" ${d.imgs.local?'':'disabled'}>Utiliser la version locale</option>
-       <option value="redo">Regénérer (nouvelle requête payante)</option>
+       <option value="">${esc(t('Garder le choix actuel'))} (${esc(t(d.choice==='ai'?'IA':d.choice==='local'?'local':'auto'))})</option>
+       <option value="ai" ${d.imgs.ai?'':'disabled'}>${esc(t('Utiliser la version IA'))}</option>
+       <option value="local" ${d.imgs.local?'':'disabled'}>${esc(t('Utiliser la version locale'))}</option>
+       <option value="redo">${esc(t('Regénérer (nouvelle requête payante)'))}</option>
      </select>
    </div>`;
   const cmp=el.querySelector('.cmp');
@@ -146,7 +167,7 @@ const grid=document.getElementById('grid');
 DATA.forEach(d=>grid.appendChild(card(d)));
 function apply(){grid.querySelectorAll('.card').forEach(c=>{c.style.display=(filter==='all'||c.dataset.status===filter)?'':'none'});updateCount()}
 function updateCount(){const vis=[...grid.children].filter(c=>c.style.display!=='none').length;
-  document.getElementById('count').textContent=`${vis} texture(s) · ${Object.keys(choices).length} choix modifié(s)`}
+  document.getElementById('count').textContent=`${vis} ${t('texture(s)')} · ${Object.keys(choices).length} ${t('choix modifié(s)')}`}
 document.querySelectorAll('.chip').forEach(c=>c.onclick=()=>{filter=c.dataset.f;document.querySelectorAll('.chip').forEach(x=>x.classList.toggle('on',x===c));apply()});
 document.getElementById('save').onclick=()=>{
   const blob=new Blob([JSON.stringify({choices},null,2)],{type:'application/json'});

@@ -3,6 +3,7 @@
     1. UI       graphismes plats -> Real-ESRGAN / Waifu2x / Lanczos, par lots (un lancement par lot)
     2. LOCAL    données techniques -> Lanczos
     3. COMFYUI  matériaux -> file ComfyUI, par groupes de workflow et lots de VRAM
+       (ou ESRGAN, mode sans ComfyUI : Real-ESRGAN réaliste par lots, voir esrgan.py)
 
 Garanties :
   - une texture en échec n'arrête pas le lot : elle est consignée (table failures +
@@ -17,6 +18,7 @@ Garanties :
 from __future__ import annotations
 
 import fnmatch
+import hashlib
 import threading
 import time
 from collections import Counter
@@ -24,7 +26,9 @@ from concurrent.futures import FIRST_COMPLETED, ThreadPoolExecutor, wait
 from pathlib import Path
 from typing import Any
 
+from .esrgan import EsrganError, EsrganJob, RealisticUpscaler
 from .events import EventBus
+from .i18n import tr
 from .imaging import local_upscale, save_png
 from .pipeline import BudgetReached, Runner, analysis_of, style_refs
 from .providers import FatalError, ServerDown, WorkflowFatal, make_provider
@@ -40,7 +44,9 @@ def _kind_of(message: str) -> str:
             return kind
     if "out of memory" in m:
         return "oom"
-    if "structure" in m or "décalage" in m or "raccord" in m or "zone modifiée" in m or "couleur locale" in m:
+    # motifs des messages de validate.evaluate, dans les deux langues (le message est déjà traduit)
+    if any(w in m for w in ("structure", "décalage", "raccord", "zone modifiée", "couleur locale",
+                            "offset", "seam", "altered area", "local color")):
         return "validation"
     return "error"
 
@@ -66,7 +72,7 @@ class Orchestrator:
     def stop_requested(self) -> bool:
         if self.stop_file.exists() and not self.runner.stop.is_set():
             self.runner.stop.set()
-            self.ev.emit("stopped", message="fichier STOP détecté")
+            self.ev.emit("stopped", message=tr("fichier STOP détecté"))
         return self.runner.stop.is_set()
 
     def _fail(self, rec: dict, stage: str, kind: str, message: str, action: str, details: str = "") -> None:
@@ -112,7 +118,7 @@ class Orchestrator:
             self.runner.stop.set()
             if self.provider is not None and hasattr(self.provider, "cancel_pending"):
                 self.provider.cancel_pending()
-            self.ev.emit("stopped", message="interruption clavier")
+            self.ev.emit("stopped", message=tr("interruption clavier"))
             raise
         finally:
             if self.provider is not None and hasattr(self.provider, "close"):
@@ -120,14 +126,18 @@ class Orchestrator:
             if self._bar is not None:
                 self._bar.close()
             s = self.stats
-            summary = (f"{s['ui']} UI, {s['local']} local, {s['ai']} ComfyUI validées, {s['fallback']} replis, "
-                       f"{s['retried']} reprises, {s['errors']} échecs")
+            summary = (tr("{ui} UI, {local} local, {ai} {engine}, {fallback} replis, {retried} "
+                          "reprises, {errors} échecs",
+                          ui=s['ui'], local=s['local'], ai=s['ai'], engine=self.engine_label(),
+                          fallback=s['fallback'], retried=s['retried'], errors=s['errors']))
             self.ev.emit("run_end", seconds=round(time.monotonic() - t0, 1), summary=summary, **dict(s))
             self.state.close()
         result = dict(self.stats)
         for key in ("ui", "local", "ai", "fallback", "transient", "errors", "retried"):
             result.setdefault(key, 0)
         result.setdefault("budget", False)
+        result["engine"] = self.provider_name
+        result["server_unreachable"] = bool(getattr(self, "server_unreachable", False))
         result["requests_used"] = self.runner.budget.used
         return result
 
@@ -137,7 +147,7 @@ class Orchestrator:
             return
         self.ev.emit("stage_start", stage="ui", count=len(rows))
         up = UiUpscaler(self.cfg, log=lambda m: self.ev.emit("info", message=m))
-        self.ev.emit("info", message=f"[UI] moteurs disponibles : {', '.join(up.available())}")
+        self.ev.emit("info", message=tr("[UI] moteurs disponibles : {engines}", engines=", ".join(up.available())))
         index = 0
         for chunk in self._chunks(rows, self.cfg["ui_upscale"].get("batch_size", 64)):
             if self.stop_requested():
@@ -148,8 +158,8 @@ class Orchestrator:
                 try:
                     src, an, k = self.runner._load(r)
                 except Exception as exc:
-                    self.state.update(r["id"], status="error", error=f"image illisible : {exc}")
-                    self._fail(r, "ui", "image", f"image illisible : {exc}", "abandon")
+                    self.state.update(r["id"], status="error", error=tr("image illisible : {exc}", exc=exc))
+                    self._fail(r, "ui", "image", tr("image illisible : {exc}", exc=exc), "abandon")
                     self.stats["errors"] += 1
                     continue
                 engine = str((r.get("analysis") or {}).get("ui_engine", ""))
@@ -160,7 +170,7 @@ class Orchestrator:
                 index += 1
                 r, res = recs[j.tid], results[j.tid]
                 if res.image is None:
-                    msg = "; ".join(res.errors) or "aucun moteur n'a abouti"
+                    msg = "; ".join(res.errors) or tr("aucun moteur n'a abouti")
                     self.state.update(j.tid, status="error", error=msg)
                     self._fail(r, "ui", "engine", msg, "abandon")
                     self.stats["errors"] += 1
@@ -176,7 +186,7 @@ class Orchestrator:
                 self.stats["ui"] += 1
                 self.ev.emit("ui_done", texture=j.tid, name=j.name, engine=res.engine, k=j.k,
                              kind=(r.get("analysis") or {}).get("ui_kind", ""), index=index, total=len(rows))
-        self.ev.emit("stage_end", stage="ui", summary=f"{self.stats['ui']} texture(s) UI traitée(s)")
+        self.ev.emit("stage_end", stage="ui", summary=tr("{ui} texture(s) UI traitée(s)", ui=self.stats['ui']))
 
     # ------------------------------------------------------------------ étape locale
     def _stage_local(self, rows: list[dict]) -> None:
@@ -196,7 +206,8 @@ class Orchestrator:
                 self.state.update(r["id"], status="error", error=str(exc))
                 self._fail(r, "local", "error", str(exc), "abandon")
                 self.stats["errors"] += 1
-        self.ev.emit("stage_end", stage="local", summary=f"{self.stats['local']} texture(s) agrandie(s)")
+        self.ev.emit("stage_end", stage="local", summary=tr("{local} texture(s) agrandie(s)",
+                                                            local=self.stats['local']))
 
     # ------------------------------------------------------------------ étape IA
     def _open_provider(self) -> bool:
@@ -226,8 +237,15 @@ class Orchestrator:
         if self._bar is not None:
             self._bar.set_postfix_str(text[:60], refresh=True)
 
+    def engine_label(self) -> str:
+        return {"comfyui": "ComfyUI", "esrgan": "Real-ESRGAN", "mock": tr("simulation"),
+                "higgsfield": "Higgsfield"}.get(self.provider_name, self.provider_name)
+
     def _stage_ai(self, rows: list[dict]) -> None:
         if not rows:
+            return
+        if self.provider_name == "esrgan":
+            self._stage_esrgan(rows)
             return
         self.ev.emit("stage_start", stage="comfyui" if self.provider_name == "comfyui" else self.provider_name,
                      count=len(rows))
@@ -244,10 +262,22 @@ class Orchestrator:
             return
         if not ok:
             policy = c.get("on_server_down", "wait")
+            self.server_unreachable = True
             if policy == "abort":
-                self.ev.emit("stopped", message="ComfyUI injoignable : textures laissées en attente")
+                self.ev.emit("stopped", message=tr("ComfyUI injoignable : textures laissées en attente"))
                 return
-            self._fallback_many(rows, "ComfyUI injoignable")
+            if RealisticUpscaler(self.cfg).available():
+                self.ev.emit("info", message=tr("⚠ ComfyUI injoignable : les {n} matières passent par Real-ESRGAN "
+                                                "(rendu réaliste, sans IA générative). Avec ComfyUI : "
+                                                "texforge retry --kind server, puis relancer.", n=len(rows)))
+                try:
+                    self._stage_esrgan(rows, fallback_reason=tr("ComfyUI injoignable"))
+                except FatalError as exc:            # Real-ESRGAN inutilisable ici : repli simple
+                    self.ev.emit("info", message=f"⚠ {exc}")
+                    left = [r for r in rows if (self.state.get(r["id"]) or {}).get("status") not in ("done", "fallback")]
+                    self._fallback_many(left, tr("ComfyUI injoignable"))
+                return
+            self._fallback_many(rows, tr("ComfyUI injoignable"))
             return
         self.runner.provider = self.provider
         self.runner.refs = style_refs(self.cfg) if self.provider_name == "higgsfield" else []
@@ -281,10 +311,11 @@ class Orchestrator:
                 break
             if (local_gpu and prev_edges is not None and edges != prev_edges and self._since_free > 0
                     and c.get("free_between_groups", True)):      # inutile si la VRAM vient d'être libérée
-                self._free("changement de workflow (Tile ↔ Tile+Canny)")
+                self._free(tr("changement de workflow (Tile ↔ Tile+Canny)"))
             prev_edges = edges
-            self.ev.emit("info", message=f"[COMFYUI] groupe : workflow {'Tile+Canny' if edges else 'Tile'}, "
-                                         f"raccord {tiling or '-'}, {len(grows)} texture(s)")
+            self.ev.emit("info", message=tr("[COMFYUI] groupe : workflow {workflow}, raccord {tiling}, {n} texture(s)",
+                                            workflow="Tile+Canny" if edges else "Tile", tiling=tiling or "-",
+                                            n=len(grows)))
             queue = list(grows)
             while queue and not self.stop_requested():
                 chunk, queue = queue[:batch_size], queue[batch_size:]
@@ -322,18 +353,19 @@ class Orchestrator:
                                          attempt=retries[rec["id"]], kind=kind)
                             requeue.append(self.state.get(rec["id"]) or rec)
                         else:
-                            self._fallback_many([rec], f"échecs passagers répétés : {msg}")
+                            self._fallback_many([rec], tr("échecs passagers répétés : {msg}", msg=msg))
                     elif outcome == "server_down":
                         server_down = True
                         requeue.append(rec)
                     elif outcome == "workflow":
                         self._fail(rec, "comfyui", "workflow", info, "abandon")
-                        self.ev.emit("stopped", message=f"workflow refusé par ComfyUI, étape arrêtée : {info}")
+                        self.ev.emit("stopped", message=tr("workflow refusé par ComfyUI, étape arrêtée : {info}",
+                                                           info=info))
                         self.stats["errors"] += 1
                         return
                     elif outcome == "budget":
                         self.stats["budget"] = True
-                        self.ev.emit("stopped", message="plafond de requêtes payantes atteint")
+                        self.ev.emit("stopped", message=tr("plafond de requêtes payantes atteint"))
                         return
                     elif outcome == "stopped":
                         pass
@@ -344,14 +376,15 @@ class Orchestrator:
                 if self._bar is not None:
                     self._bar.update(sum(1 for _, o, _, _ in outcomes if o in ("ai", "fallback", "error", "fatal")))
                 if consecutive >= int(c.get("max_consecutive_failures", 8)):
-                    self.ev.emit("stopped", message=f"{consecutive} échecs consécutifs : vérifie ComfyUI et le workflow")
+                    self.ev.emit("stopped", message=tr("{n} échecs consécutifs : vérifie ComfyUI et le workflow",
+                                                       n=consecutive))
                     return
                 if server_down:
                     if self._wait_server():
                         queue = requeue + queue
                         continue
                     if c.get("on_server_down", "wait") == "abort":
-                        self.ev.emit("stopped", message="ComfyUI injoignable : textures restantes laissées en attente")
+                        self.ev.emit("stopped", message=tr("ComfyUI injoignable : textures restantes laissées en attente"))
                         return
                     seen: set[str] = set()
                     rest: list[dict] = []
@@ -361,16 +394,17 @@ class Orchestrator:
                             if cur and cur["status"] in ("pending", "error") and r["id"] not in seen:
                                 seen.add(r["id"])
                                 rest.append(cur)
-                    self._fallback_many(rest, "ComfyUI injoignable")
+                    self._fallback_many(rest, tr("ComfyUI injoignable"))
                     return
                 queue = queue + requeue
                 if oom and local_gpu:
-                    self._free("mémoire saturée (OOM) avant nouvel essai")
+                    self._free(tr("mémoire saturée (OOM) avant nouvel essai"))
                 elif local_gpu:
                     self._housekeeping(len(chunk))
         self.ev.emit("stage_end", stage="comfyui",
-                     summary=f"{self.stats['ai']} validée(s), {self.stats['fallback']} repli(s), "
-                             f"{self.stats['retried']} reprise(s)")
+                     summary=tr("{ai} validée(s), {fallback} repli(s), {retried} reprise(s)",
+                                ai=self.stats['ai'], fallback=self.stats['fallback'],
+                                retried=self.stats['retried']))
 
     def _run_chunk(self, chunk: list[dict], workers: int, total: int,
                    contexts: dict[str, dict]) -> list[tuple[dict, str, str, float]]:
@@ -432,30 +466,31 @@ class Orchestrator:
             self._since_free = 0
             self.ev.emit("gpu_free", reason=reason, vram_free_gb=None if free is None else round(free / 1024 ** 3, 2))
         except ServerDown as exc:
-            self.ev.emit("server_down", message=f"libération de la VRAM impossible : {exc}")
+            self.ev.emit("server_down", message=tr("libération de la VRAM impossible : {exc}", exc=exc))
 
     def _housekeeping(self, processed: int) -> None:
         c = self.cfg["comfyui"]
         self._since_free += processed
         every = int(c.get("free_every", 0) or 0)
         if every and self._since_free >= every:
-            self._free(f"{self._since_free} textures depuis la dernière libération")
+            self._free(tr("{n} textures depuis la dernière libération", n=self._since_free))
             return
         policy = c.get("free_vram", "auto")
         if policy == "always":
-            self._free("fin de lot")
+            self._free(tr("fin de lot"))
         elif policy == "auto":
             free = self.provider.vram_free()
             if free is not None:
                 self.ev.emit("gpu_status", vram_free_gb=round(free / 1024 ** 3, 2))
                 if free < float(c.get("vram_threshold_gb", 1.5)) * 1024 ** 3:
-                    self._free(f"VRAM libre {free / 1024 ** 3:.1f} Go sous le seuil")
+                    self._free(tr("VRAM libre {v:.1f} Go sous le seuil", v=free / 1024 ** 3))
 
     def _wait_server(self) -> bool:
         c = self.cfg["comfyui"]
         if c.get("on_server_down", "wait") != "wait":
             return False
-        self.ev.emit("server_down", message=f"attente du redémarrage ({c.get('server_wait', 120)} s max)")
+        self.ev.emit("server_down", message=tr("attente du redémarrage ({seconds} s max)",
+                                               seconds=c.get("server_wait", 120)))
         deadline = time.monotonic() + float(c.get("server_wait", 120))
         while time.monotonic() < deadline and not self.stop_requested():
             time.sleep(5)
@@ -468,6 +503,84 @@ class Orchestrator:
         return False
 
     # ------------------------------------------------------------------ repli
+    # ------------------------------------------------------------------ mode sans ComfyUI
+    def _stage_esrgan(self, rows: list[dict], fallback_reason: str = "") -> None:
+        """Real-ESRGAN réaliste, par lots. fallback_reason : ComfyUI était prévu mais injoignable ;
+        les textures sont alors marquées « repli » (texforge retry les renverra vers ComfyUI)."""
+        if not rows:
+            return
+        if not fallback_reason:
+            self.ev.emit("stage_start", stage="esrgan", count=len(rows))
+        up = RealisticUpscaler(self.cfg, log=lambda m: self.ev.emit("info", message=m))
+        if not up.available():
+            raise FatalError(tr("Real-ESRGAN introuvable : bouton « Installer Real-ESRGAN » ou "
+                                "python -m texforge install-realesrgan"))
+        self.ev.emit("info", message=tr("[ESRGAN] {exe}", exe=up.exe))
+        size = int(up.e.get("batch_size", 32))
+        index, done_any = 0, False
+        for chunk in self._chunks(rows, size):
+            if self.stop_requested():
+                break
+            jobs, recs = [], {}
+            for r in chunk:
+                try:
+                    src, an, k = self.runner._load(r)
+                except Exception as exc:
+                    self.state.update(r["id"], status="error", error=tr("image illisible : {exc}", exc=exc))
+                    self._fail(r, "esrgan", "image", tr("image illisible : {exc}", exc=exc), "abandon")
+                    self.stats["errors"] += 1
+                    continue
+                material = str((r.get("analysis") or {}).get("material") or "generic")
+                seed = int(hashlib.sha1(r["id"].encode()).hexdigest()[:8], 16)
+                jobs.append(EsrganJob(r["id"], r["name"], src.convert("RGBA"), an, k, material, seed))
+                recs[r["id"]] = r
+            if not jobs:
+                continue
+            try:
+                results = up.run(jobs)
+            except EsrganError as exc:
+                if not done_any:                 # premier lot : Real-ESRGAN ne marche pas ici (pilote Vulkan…)
+                    raise FatalError(str(exc)) from exc
+                for j in jobs:
+                    self._fail(recs[j.tid], "esrgan", "engine", str(exc), "abandon")
+                    self.state.update(j.tid, status="error", error=str(exc))
+                    self.stats["errors"] += 1
+                continue
+            for j in jobs:
+                index += 1
+                r, res = recs[j.tid], results[j.tid]
+                if res.image is None:
+                    self._fail(r, "esrgan", "engine", res.error, "abandon")
+                    self.state.update(j.tid, status="error", error=res.error)
+                    self.stats["errors"] += 1
+                    continue
+                done_any = True
+                p = self.runner._paths(j.tid)
+                save_png(res.image, p["ai"])
+                save_png(res.image, p["result"])
+                # repli du contrôle qualité : agrandissement simple, sans invention
+                save_png(local_upscale(j.src, j.k, j.an, self.cfg, use_esrgan=False), p["local"])
+                metrics = {"method": "esrgan", "k": j.k, **res.info}
+                if fallback_reason:
+                    self.state.update(j.tid, status="fallback", choice="local", result_path=str(p["result"]),
+                                      ai_path=str(p["ai"]), local_path=str(p["ai"]), error=fallback_reason,
+                                      fingerprint=self.runner.fp, metrics={**metrics, "fallback_engine": "esrgan"})
+                    self._fail(r, "comfyui", "server", fallback_reason, "fallback")
+                    self.stats["fallback"] += 1
+                    self.ev.emit("fallback", texture=j.tid, name=j.name, engine="Real-ESRGAN",
+                                 reason=fallback_reason, index=index, total=len(rows))
+                    continue
+                self.state.update(j.tid, status="done", choice="ai", result_path=str(p["result"]),
+                                  ai_path=str(p["ai"]), local_path=str(p["local"]), error=None,
+                                  fingerprint=self.runner.fp, metrics=metrics)
+                self.stats["ai"] += 1
+                self.ev.emit("esrgan_done", texture=j.tid, name=j.name, k=j.k, material=j.material,
+                             guard=res.info.get("guard", 0.0), grain=res.info.get("grain", 0.0),
+                             index=index, total=len(rows))
+        if not fallback_reason:
+            self.ev.emit("stage_end", stage="esrgan", summary=tr("{n} texture(s) agrandie(s) par Real-ESRGAN",
+                                                                 n=self.stats["ai"]))
+
     def _fallback_many(self, rows: list[dict], reason: str) -> None:
         if not rows:
             return
@@ -477,7 +590,7 @@ class Orchestrator:
             try:
                 src, an, k = self.runner._load(r)
             except Exception as exc:
-                self._fail(r, "comfyui", "image", f"image illisible : {exc}", "abandon")
+                self._fail(r, "comfyui", "image", tr("image illisible : {exc}", exc=exc), "abandon")
                 self.stats["errors"] += 1
                 continue
             jobs.append(UiJob(r["id"], r["name"], src.convert("RGBA"), k, an))

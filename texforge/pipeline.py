@@ -14,6 +14,7 @@ from typing import Callable
 
 from PIL import Image
 
+from .i18n import tr
 from .config import DEFAULT_PROMPT, result_fingerprint
 from .imaging import (IMAGE_EXTS, Analysis, analyze, finalize_ai, load_texture, local_upscale,
                       output_scale, prepare_for_model, prepare_native, save_png)
@@ -80,7 +81,7 @@ def style_refs(cfg: dict) -> list[Path]:
         pp = Path(p)
         pp = pp if pp.is_absolute() else Path(cfg["_base"]) / pp
         if not pp.exists():
-            raise FatalError(f"image de référence introuvable : {pp}")
+            raise FatalError(tr("image de référence introuvable : {path}", path=pp))
         out.append(pp)
     return out
 
@@ -88,7 +89,7 @@ def style_refs(cfg: dict) -> list[Path]:
 def analysis_of(rec: dict) -> Analysis:
     d = dict(rec["analysis"])
     d.pop("error", None)
-    return Analysis(**{k: d[k] for k in Analysis.__dataclass_fields__})
+    return Analysis(**{k: d[k] for k in Analysis.__dataclass_fields__ if k in d})   # champs récents : défaut
 
 
 # ------------------------------------------------------------------ scan
@@ -104,7 +105,7 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
     for root_s in cfg["_inputs"]:
         root = Path(root_s)
         if not root.exists():
-            log(f"  ! dossier introuvable : {root}")
+            log(tr("  ! dossier introuvable : {root}", root=root))
             continue
         files = sorted(p for p in root.rglob("*") if p.is_file() and p.suffix.lower() in IMAGE_EXTS
                        and work not in p.resolve().parents)
@@ -136,6 +137,11 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
                     auto_mode = d.mode
                     an_d.update(route=d.route, category=d.category, ui_kind=d.ui_kind, material=d.material,
                                 ui_score=d.ui_score, route_reason=d.reason, features=d.features)
+                if src.fmt in ("BC4", "BC5") and auto_mode != "keep":
+                    # un ou deux canaux : jamais une image en couleur (relief, spéculaire, masque)
+                    auto_mode = "upscale"
+                    an_d.update(route="local", category="data",
+                                route_reason=tr("format {fmt} : carte de données, agrandie sans IA", fmt=src.fmt))
                 rec.update(fmt=src.fmt, mipmaps=src.mipmaps, width=src.image.width, height=src.image.height)
             except Exception as exc:
                 counts["errors"] += 1
@@ -152,7 +158,7 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
                 if extra.get("engine"):
                     an_d["ui_engine"] = extra["engine"]
                 if extra.get("rule"):
-                    an_d["route_reason"] = f"règle « {extra['rule']} »"
+                    an_d["route_reason"] = tr("règle « {rule} »", rule=extra['rule'])
                 an_d["route"] = {"ai": "comfyui", "ui": "ui", "upscale": "local", "keep": "keep"}[mode]
             counts["route_" + an_d.get("route", "keep")] = counts.get("route_" + an_d.get("route", "keep"), 0) + 1
             rec.update(analysis=an_d, mode=mode, hint=hint)
@@ -303,7 +309,7 @@ class Runner:
             if not self.provider.paid:
                 self.state.finish_request(req["request_id"], "failed")
                 continue
-            self.log(f"    reprise de la requête {req['request_id'][:8]}… ({rec['name']})")
+            self.log(tr("    reprise de la requête {rid}… ({name})", rid=req["request_id"][:8], name=rec["name"]))
             try:
                 out_img, url = self.provider.resume(req["request_id"])
             except ProviderError as exc:
@@ -373,9 +379,9 @@ class Runner:
                 local, engine = self.fallback_image(src, an, k)
                 save_png(local, p["local"])
             except Exception as exc:   # le repli amélioré a échoué : Lanczos déjà calculé
-                errors.append(f"repli {exc}")
+                errors.append(tr("repli {exc}", exc=exc))
         save_png(local, p["result"])
-        reason = "; ".join(best["metrics"]["reasons"]) if best else ("; ".join(errors) or "aucun résultat")
+        reason = "; ".join(best["metrics"]["reasons"]) if best else ("; ".join(errors) or tr("aucun résultat"))
         self.state.update(tid, status="fallback", choice="local", result_path=str(p["result"]),
                           local_path=str(p["local"]), fingerprint=self.fp, error=reason,
                           metrics={**(best["metrics"] if best else {}), "fallback_engine": engine, "k": k})
@@ -394,7 +400,9 @@ class Runner:
         stale = [r for r in self.state.all("status IN ('done','fallback')")
                  if r["mode"] == "ai" and r.get("fingerprint") not in (None, self.fp)]
         if stale and not redo_stale:
-            self.log(f"  ℹ {len(stale)} texture(s) traitée(s) avec d'anciens réglages (relance avec --redo-stale pour les refaire)")
+            self.log(tr("  ℹ {n} texture(s) traitée(s) avec d'anciens réglages (relance avec --redo-stale pour "
+                        "les refaire)",
+                        n=len(stale)))
         local_rows = [r for r in rows if r["mode"] == "upscale"]
         ai_rows = [r for r in rows if r["mode"] == "ai"]
         if limit is not None:
@@ -408,9 +416,9 @@ class Runner:
             except Exception as exc:
                 stats["errors"] += 1
                 self.state.update(r["id"], status="error", error=str(exc))
-                self.log(f"  ✗ {r['name']} : {exc}")
+                self.log(tr("  ✗ {name} : {exc}", name=r['name'], exc=exc))
         if local_rows:
-            self.log(f"  agrandissement local : {stats['local']} texture(s)")
+            self.log(tr("  agrandissement local : {local} texture(s)", local=stats['local']))
 
         if local_only or not ai_rows:
             self.state.close()
@@ -421,8 +429,9 @@ class Runner:
         total = len(ai_rows)
         done = 0
         workers = max(1, int(self.cfg["provider"].get("workers", 3)))
-        self.log(f"  génération IA ({self.provider.name}) : {total} texture(s), {workers} en parallèle"
-                 + (f", plafond {self.budget.limit} requêtes" if self.provider.paid and self.budget.limit else ""))
+        self.log(tr("  génération IA ({name}) : {total} texture(s), {workers} en parallèle",
+                    name=self.provider.name, total=total, workers=workers)
+                 + (tr(", plafond {limit} requêtes", limit=self.budget.limit) if self.provider.paid and self.budget.limit else ""))
         pool = ThreadPoolExecutor(max_workers=workers)
         futures = {pool.submit(self._safe_ai, r): r for r in ai_rows}
         pending = set(futures)
@@ -441,15 +450,17 @@ class Runner:
                         stats[outcome] += 1
                     cur = self.state.get(r["id"]) or {}
                     m = cur.get("metrics") or {}
-                    tag = {"ai": "✓ IA", "fallback": "↺ repli local", "transient": "… à reprendre",
-                           "errors": "✗ erreur", "stopped": "■ arrêt"}.get(outcome, outcome)
-                    detail = f"structure {m.get('structure', '-')}, essais {cur.get('attempts', 0)}" if m else (info or "")
+                    tag = {"ai": tr("✓ IA"), "fallback": tr("↺ repli local"), "transient": tr("… à reprendre"),
+                           "errors": tr("✗ erreur"), "stopped": tr("■ arrêt")}.get(outcome, outcome)
+                    detail = tr("structure {structure}, essais {attempts}",
+                                structure=m.get("structure", "-"), attempts=cur.get("attempts", 0)) if m else (info or "")
                     if outcome == "fallback" and cur.get("error"):
                         detail += f" — {cur['error'][:90]}"
-                    self.log(f"  [{done}/{total}] {r['name']} : {tag} ({detail})")
+                    self.log(tr("  [{done}/{total}] {name} : {tag} ({detail})",
+                                done=done, total=total, name=r['name'], tag=tag, detail=detail))
         except KeyboardInterrupt:
             self.stop.set()
-            self.log("  ■ interruption : les requêtes déjà lancées seront reprises au prochain run")
+            self.log(tr("  ■ interruption : les requêtes déjà lancées seront reprises au prochain run"))
             pool.shutdown(wait=False, cancel_futures=True)
             raise
         pool.shutdown(wait=True)
@@ -461,7 +472,7 @@ class Runner:
 
     def _safe_ai(self, rec: dict) -> tuple[str, str]:
         if self.stop.is_set():
-            return "stopped", "arrêt demandé"
+            return "stopped", tr("arrêt demandé")
         try:
             return self.do_ai(rec), ""
         except BudgetReached:

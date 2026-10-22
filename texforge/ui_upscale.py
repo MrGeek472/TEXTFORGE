@@ -26,6 +26,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageFilter
 
+from .i18n import tr
 from .imaging import LANCZOS, Analysis, bleed_rgb, local_upscale
 from .validate import evaluate
 
@@ -87,8 +88,13 @@ class UiUpscaler:
             return None
         raw = str(self.u.get(key, "") or "")
         if not raw:
+            if engine == "realesrgan":              # installé dans tools\ ou présent dans le PATH
+                from .esrgan import find_realesrgan
+                return find_realesrgan(self.cfg)
             return None
         p = Path(raw)
+        if engine not in p.stem.lower():           # jamais un autre programme choisi par erreur
+            return None
         if not p.is_absolute():
             p = Path(self.cfg["_base"]) / p
         return p if p.exists() else None
@@ -119,12 +125,12 @@ class UiUpscaler:
                 continue
             if engine in ("realesrgan", "waifu2x") and self._exe(engine) is None:
                 for j in todo:
-                    results[j.tid].errors.append(f"{engine} : exécutable non configuré")
+                    results[j.tid].errors.append(tr("{engine} : exécutable non configuré", engine=engine))
                 continue
             try:
                 produced = self._run_engine(engine, todo)
             except EngineError as exc:
-                self.log(f"[UI] moteur {engine} en échec pour le lot : {exc}")
+                self.log(tr("[UI] moteur {engine} en échec pour le lot : {exc}", engine=engine, exc=exc))
                 for j in todo:
                     results[j.tid].errors.append(f"{engine} : {exc}")
                 continue
@@ -133,14 +139,15 @@ class UiUpscaler:
                 img = produced.get(j.tid)
                 if img is None:
                     if j in todo:
-                        results[j.tid].errors.append(f"{engine} : aucune sortie")
+                        results[j.tid].errors.append(tr("{engine} : aucune sortie", engine=engine))
                     still.append(j)
                     continue
                 if validate and engine != "lanczos":
                     # un graphisme d'interface ne se répète pas : pas de contrôle de raccord
                     m = evaluate(j.src, img, dc_replace(j.an, tile_x=False, tile_y=False), self.cfg)
                     if not m["passed"]:
-                        results[j.tid].errors.append(f"{engine} : rejeté ({'; '.join(m['reasons'])})")
+                        results[j.tid].errors.append(tr("{engine} : rejeté ({reasons})",
+                                                        engine=engine, reasons="; ".join(m["reasons"])))
                         still.append(j)
                         continue
                 results[j.tid].image = img
@@ -206,14 +213,15 @@ class UiUpscaler:
                 proc = subprocess.run(cmd, capture_output=True, timeout=timeout,
                                       cwd=str(exe.parent))   # les modèles ncnn sont cherchés à côté de l'exe
             except subprocess.TimeoutExpired as exc:
-                raise EngineError(f"délai de {timeout:.0f} s dépassé") from exc
+                raise EngineError(tr("délai de {timeout:.0f} s dépassé", timeout=timeout)) from exc
             except OSError as exc:
-                raise EngineError(f"lancement impossible : {exc}") from exc
+                raise EngineError(tr("lancement impossible : {exc}", exc=exc)) from exc
             if proc.returncode != 0:
                 tail = (proc.stderr or proc.stdout or b"").decode("utf-8", "replace").strip().splitlines()[-3:]
-                raise EngineError(f"code {proc.returncode} : {' | '.join(tail)}")
-            self.log(f"[UI] {engine} ({self.model if engine == 'realesrgan' else 'waifu2x'}, ×{scale}) : "
-                     f"{len(jobs)} image(s) en {time.monotonic() - t0:.1f} s")
+                raise EngineError(tr("code {code} : {tail}", code=proc.returncode, tail=" | ".join(tail)))
+            self.log(tr("[UI] {engine} ({model}, ×{scale}) : {n} image(s) en {seconds:.1f} s",
+                        engine=engine, model=self.model if engine == "realesrgan" else "waifu2x", scale=scale,
+                        n=len(jobs), seconds=time.monotonic() - t0))
             produced: dict[str, Image.Image] = {}
             for key, j in index.items():
                 f = out_dir / f"{key}.png"

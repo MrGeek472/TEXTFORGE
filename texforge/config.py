@@ -9,6 +9,8 @@ import json
 import sys
 from pathlib import Path
 
+from .i18n import tr
+
 if sys.version_info >= (3, 11):
     import tomllib
 else:  # pragma: no cover
@@ -57,6 +59,8 @@ DEFAULTS: dict = {
     "quality": {"min_structure": 0.65, "max_shift": 0.03, "min_local": 0.3, "max_local_color": 0.12,
                 "max_seam_ratio": 1.8, "color_match": 0.6},
     "local": {"esrgan_exe": "", "esrgan_model": "realesrgan-x4plus"},
+    # mode sans ComfyUI (provider.name = "esrgan") : valeurs par défaut dans texforge/esrgan.py
+    "esrgan": {},
     "qc": {
         "enabled": True, "auto_fix": True, "workers": 4, "chunk": 32,
         # fidélité à la DA, mesurée à la résolution d'origine
@@ -66,7 +70,7 @@ DEFAULTS: dict = {
         # détail (avertissements seulement)
         "min_detail_gain": 1.1, "max_grain": 0.11,
         # raccord (en plus de [quality] max_seam_ratio)
-        "max_seam_local": 1.6, "max_seam_step": 4.0, "max_seam_align_gain": 0.3,
+        "max_seam_local": 1.6, "max_seam_step": 4.0, "max_seam_align_gain": 0.3, "seam_joint_match": 0.35,
         # transparence
         "min_alpha_iou": 0.97, "max_alpha_error": 0.03, "alpha_ref": 0.5,
         # correctifs
@@ -143,11 +147,11 @@ def _merge(base: dict, over: dict) -> dict:
 
 def load_config(path: Path) -> dict:
     if not path.exists():
-        raise ConfigError(f"configuration introuvable : {path} (lance d'abord : texforge init)")
+        raise ConfigError(tr("configuration introuvable : {path} (lance d'abord : texforge init)", path=path))
     try:
         user = tomllib.loads(path.read_text(encoding="utf-8"))
     except Exception as exc:
-        raise ConfigError(f"erreur de syntaxe dans {path} : {exc}") from exc
+        raise ConfigError(tr("erreur de syntaxe dans {path} : {exc}", path=path, exc=exc)) from exc
     cfg = _merge(DEFAULTS, user)
     base = path.parent.resolve()
     cfg["_base"] = str(base)
@@ -174,6 +178,7 @@ def result_fingerprint(cfg: dict) -> str:
                                                      "prompt_prefix_tiled", "prompt_suffix", "negative",
                                                      "checkpoint", "controlnet_model", "lora", "lora_strength")},
         "materials": cfg.get("materials", {}),
+        "esrgan": cfg.get("esrgan", {}) if cfg["provider"]["name"] == "esrgan" else {},
     }
     return hashlib.sha256(json.dumps(relevant, sort_keys=True).encode()).hexdigest()[:16]
 
@@ -206,9 +211,21 @@ max_ai_aspect = 3.0  # format plus allongé que 3:1 -> agrandissement local
 tile_threshold = 1.5 # détection des textures répétables (plus haut = plus permissif)
 
 [provider]
-name = "comfyui"     # "comfyui" (local), "mock" (test gratuit) ou "higgsfield" (cloud, optionnel)
+name = "comfyui"     # "comfyui" (local), "esrgan" (sans ComfyUI : Real-ESRGAN réaliste), "mock" (test
+                     # gratuit) ou "higgsfield" (cloud, optionnel)
 max_attempts = 3     # essais par texture (graines différentes) avant repli
 base_seed = 1234
+
+[esrgan]
+# Mode sans ComfyUI : Real-ESRGAN x4plus + garde anti-invention (realesr-animevideov3), verrou des
+# couleurs de l'original, accord du détail (grain de matière dosé d'après la texture).
+# Exécutable : tools\realesrgan-ncnn-vulkan\ (texforge install-realesrgan), [ui_upscale] realesrgan_exe ou PATH.
+# detail = 1.0      # micro-détail : 0 = aucun grain ajouté, 1 = dose mesurée, 1.5 = appuyé
+# color_lock = 1.0  # 1 = couleurs et éclairage de l'original, 0 = ceux du modèle
+# guard = [3.0, 9.0]  # garde anti-invention : rapport d'énergie de détail x4plus / prudent
+# tta = false       # 8 passes par image : un peu plus propre, 8 fois plus lent
+# [esrgan.materials]  # dose de grain par matériau (stone, masonry, wood, fabric, metal, vegetation…)
+# metal = 0.6
 
 [comfyui]
 server = "http://127.0.0.1:8188"
@@ -287,7 +304,8 @@ max_lightness_shift = 6.0   # luminosité (L*)
 max_palette_distance = 0.35 # histogrammes Lab (0 = même palette)
 max_seam_local = 1.6        # raccord : cassure par rapport aux colonnes voisines
 max_seam_step = 4.0         # raccord : dérive de couleur d'un bord à l'autre (ΔE)
-color_lock = 1.0            # force du verrou couleur quand il est déclenché (0 à 1)
+seam_joint_match = 0.35     # joint pile au bord (carrelage) : écart toléré entre le saut au bord et le joint interne
+color_lock = 1.0           # force du verrou couleur quand il est déclenché (0 à 1)
 color_lock_always = 0.0     # > 0 : verrou léger appliqué à toutes les textures IA
 alpha_ref = 0.5             # seuil du test alpha du jeu (0x80 = 0.5) : couverture des mipmaps conservée
 # DDS

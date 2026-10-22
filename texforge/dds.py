@@ -15,6 +15,8 @@ from dataclasses import dataclass, field
 import numpy as np
 from PIL import Image
 
+from .i18n import tr
+
 DDS_MAGIC = b"DDS "
 
 # Drapeaux d'en-tête
@@ -126,10 +128,10 @@ def _identify_uncompressed(flags: int, bits: int, r: int, g: int, b: int, a: int
 
 def read_info(data: bytes) -> DDSInfo:
     if len(data) < 128 or data[:4] != DDS_MAGIC:
-        raise DDSError("fichier DDS invalide (signature absente)")
+        raise DDSError(tr("fichier DDS invalide (signature absente)"))
     (size, flags, height, width, _pitch, _depth, mips) = struct.unpack_from("<7I", data, 4)
     if size != 124:
-        raise DDSError(f"taille d'en-tête inattendue ({size})")
+        raise DDSError(tr("taille d'en-tête inattendue ({size})", size=size))
     pf_size, pf_flags, fourcc, bits, rm, gm, bm, am = struct.unpack_from("<2I4s5I", data, 76)
     caps, caps2 = struct.unpack_from("<2I", data, 108)
     # Masque alpha effectif : ignoré si le fichier ne déclare pas d'alpha (cas X8R8G8B8)
@@ -144,7 +146,7 @@ def read_info(data: bytes) -> DDSInfo:
         if cc == "DX10":
             info.dx10 = True
             if len(data) < 148:
-                raise DDSError("en-tête DX10 tronqué")
+                raise DDSError(tr("en-tête DX10 tronqué"))
             dxgi = struct.unpack_from("<I", data, 128)[0]
             info.format = DXGI_NAMES.get(dxgi, f"DXGI_{dxgi}")
         elif cc in ("DXT1", "DXT2", "DXT3", "DXT4", "DXT5"):
@@ -173,7 +175,7 @@ def _decode_uncompressed(data: bytes, info: DDSInfo) -> Image.Image:
     bits, rm, gm, bm, am = info.masks
     bpp = bits // 8
     if bpp not in (1, 2, 3, 4):
-        raise DDSError(f"profondeur non gérée ({bits} bits)")
+        raise DDSError(tr("profondeur non gérée ({bits} bits)", bits=bits))
     offset = 128
     count = info.width * info.height
     raw = np.frombuffer(data, dtype=np.uint8, count=count * bpp, offset=offset)
@@ -217,7 +219,7 @@ def load_dds(data: bytes) -> tuple[Image.Image, DDSInfo]:
     les informations de format."""
     info = read_info(data)
     if info.cubemap or info.volume:
-        raise DDSError("cubemap ou texture volumique : non traitée")
+        raise DDSError(tr("cubemap ou texture volumique : non traitée"))
     if info.format in UNCOMPRESSED_LAYOUTS and not info.dx10:
         return _decode_uncompressed(data, info), info
     if info.dx10:
@@ -237,7 +239,7 @@ def load_dds(data: bytes) -> tuple[Image.Image, DDSInfo]:
         img = Image.open(io.BytesIO(data))
         img.load()
     except Exception as exc:  # Pillow ne connaît pas ce format
-        raise DDSError(f"décodage impossible du format {info.format} : {exc}") from exc
+        raise DDSError(tr("décodage impossible du format {format} : {exc}", format=info.format, exc=exc)) from exc
     return img.convert("RGBA"), info
 
 
@@ -313,7 +315,7 @@ def encode_blocks(rgba: np.ndarray, codec: str) -> bytes:
         alpha = np.frombuffer(_dxt3_alpha(arr[..., 3]), np.uint8).reshape(-1, 8)
         return np.concatenate([alpha, color], axis=1).tobytes()
     if codec not in ("DXT1", "DXT5"):
-        raise DDSError(f"encodeur intégré : format {codec} non géré")
+        raise DDSError(tr("encodeur intégré : format {codec} non géré", codec=codec))
     return _pillow_blocks(img, codec)
 
 
@@ -392,7 +394,7 @@ def make_header(fmt: str, w: int, h: int, levels: int) -> bytes:
     formats DX10 : extension DX10 avec le code DXGI exact (sRGB compris)."""
     codec = codec_of(fmt)
     if fmt not in WRITABLE_FORMATS and fmt not in DX10_WRITE:
-        raise DDSError(f"format d'écriture non géré : {fmt}")
+        raise DDSError(tr("format d'écriture non géré : {fmt}", fmt=fmt))
     flags = DDSD_CAPS | DDSD_HEIGHT | DDSD_WIDTH | DDSD_PIXELFORMAT
     caps = DDSCAPS_TEXTURE
     if levels > 1:
@@ -425,7 +427,8 @@ def write_dds(fmt: str, w: int, h: int, payloads: list[bytes]) -> bytes:
     for i, p in enumerate(payloads):
         lw, lh = level_dims(w, h, i)
         if len(p) != level_bytes(lw, lh, codec):
-            raise DDSError(f"niveau {i} ({lw}x{lh}) : {len(p)} octets au lieu de {level_bytes(lw, lh, codec)}")
+            raise DDSError(tr("niveau {i} ({lw}x{lh}) : {n} octets au lieu de {expected}",
+                              i=i, lw=lw, lh=lh, n=len(p), expected=level_bytes(lw, lh, codec)))
     return make_header(fmt, w, h, len(payloads)) + b"".join(payloads)
 
 
@@ -433,17 +436,17 @@ def split_levels(data: bytes) -> tuple[DDSInfo, str, list[tuple[int, int, bytes]
     """Découpe un DDS 2D en niveaux (largeur, hauteur, données)."""
     info = read_info(data)
     if info.cubemap or info.volume:
-        raise DDSError("cubemap ou texture volumique : non gérée")
+        raise DDSError(tr("cubemap ou texture volumique : non gérée"))
     codec = codec_of(info.format) if info.dx10 else info.format
     if codec not in BLOCK_BYTES and codec not in UNCOMPRESSED_LAYOUTS:
-        raise DDSError(f"format {info.format} : découpage non géré")
+        raise DDSError(tr("format {format} : découpage non géré", format=info.format))
     off = 148 if info.dx10 else 128
     out = []
     for i in range(info.mipmaps):
         lw, lh = level_dims(info.width, info.height, i)
         n = level_bytes(lw, lh, codec)
         if off + n > len(data):
-            raise DDSError(f"fichier tronqué au niveau {i}")
+            raise DDSError(tr("fichier tronqué au niveau {i}", i=i))
         out.append((lw, lh, data[off:off + n]))
         off += n
     return info, codec, out
@@ -467,7 +470,7 @@ def encode_dds(img: Image.Image, fmt: str, mipmaps: int, preserve_coverage: bool
     """Encode une image RGBA en DDS. Formats legacy (DXT1/3/5, masques) : en-tête
     compatible DX9. Formats DX10_LAYOUT : en-tête DX10 avec le code DXGI d'origine."""
     if fmt not in WRITABLE_FORMATS:
-        raise DDSError(f"format d'écriture non géré : {fmt}")
+        raise DDSError(tr("format d'écriture non géré : {fmt}", fmt=fmt))
     dxgi = None
     if fmt in DX10_LAYOUT:
         dxgi, fmt = DX10_LAYOUT[fmt]

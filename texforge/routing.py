@@ -25,6 +25,7 @@ from dataclasses import asdict, dataclass, field
 import numpy as np
 from PIL import Image
 
+from .i18n import tr
 from .imaging import Analysis, luminance, to_f32
 
 # --------------------------------------------------------------------------- vocabulaire des noms
@@ -252,7 +253,7 @@ def _ui_score(f: Features, an: Analysis, hints: NameHints, rc: dict) -> tuple[fl
     score, why = 0.0, []
     if hints.ui:
         score += hints.ui
-        why.append(f"nom « {'/'.join(w for w in hints.words if w in UI_STRONG | UI_WEAK)} »")
+        why.append(tr("nom « {words} »", words="/".join(w for w in hints.words if w in UI_STRONG | UI_WEAK)))
     if hints.material:
         score -= 0.5
     # Sans aucune arête franche (dégradé de ciel, peau lisse), aplats et palette réduite ne
@@ -262,28 +263,28 @@ def _ui_score(f: Features, an: Analysis, hints: NameHints, rc: dict) -> tuple[fl
         pass
     elif f.flat > float(rc["flat_strong"]):
         score += 0.3
-        why.append(f"{f.flat:.0%} d'aplats")
+        why.append(tr("{flat:.0%} d'aplats", flat=f.flat))
     elif f.flat > float(rc["flat_weak"]):
         score += 0.15
-        why.append(f"{f.flat:.0%} d'aplats")
+        why.append(tr("{flat:.0%} d'aplats", flat=f.flat))
     if not shapes:
         score -= 0.2
     elif f.colors <= int(rc["few_colors"]):
         score += 0.3
-        why.append(f"{f.colors} couleurs")
+        why.append(tr("{colors} couleurs", colors=f.colors))
     elif f.colors <= int(rc["some_colors"]):
         score += 0.15
-        why.append(f"{f.colors} couleurs")
+        why.append(tr("{colors} couleurs", colors=f.colors))
     elif f.colors > int(rc["many_colors"]):
         score -= 0.2
     if f.hard_edges > 0.35 and f.flat > 0.3:
         score += 0.15
-        why.append("bords francs")
+        why.append(tr("bords francs"))
     font = (f.glyphs >= int(rc["font_min_glyphs"]) and f.mono > 0.6 and f.transparent > 0.4
             and f.glyph_spread < float(rc["font_max_spread"]))
     if font:
         score += 0.5
-        why.append(f"feuille de {f.glyphs} glyphes")
+        why.append(tr("feuille de {glyphs} glyphes", glyphs=f.glyphs))
     # Un bord transparent ou uni « se raccorde » trivialement : le raccord ne pèse que sur
     # une image opaque et texturée
     textured = f.transparent < 0.2 and f.flat < float(rc["flat_strong"])
@@ -311,20 +312,21 @@ def _ui_score(f: Features, an: Analysis, hints: NameHints, rc: dict) -> tuple[fl
 def _material(f: Features, an: Analysis, hints: NameHints) -> tuple[str, str]:
     if hints.material:
         word = next((w for w in hints.words if w in MATERIAL_TOKENS[hints.material]), hints.material)
-        return hints.material, f"nom « {word} »"
+        return hints.material, tr("nom « {word} »", word=word)
     if f.green > 0.35:
-        return "vegetation", f"{f.green:.0%} de vert"
+        return "vegetation", tr("{green:.0%} de vert", green=f.green)
     if f.skin > 0.5 and f.energy < 0.03:
-        return "skin", f"{f.skin:.0%} de teintes peau, surface lisse"
+        return "skin", tr("{skin:.0%} de teintes peau, surface lisse", skin=f.skin)
     if f.axis_edges > 0.45 and (an.tile_x or an.tile_y) and f.hard_edges > 0.1:
-        return "masonry", f"{f.axis_edges:.0%} de bords alignés"
+        return "masonry", tr("{axis_edges:.0%} de bords alignés", axis_edges=f.axis_edges)
     if f.coherence > 0.45 and f.brown > 0.25:
-        return "wood", f"fibres orientées ({f.coherence:.2f}), {f.brown:.0%} de brun"
+        return "wood", tr("fibres orientées ({coherence:.2f}), {brown:.0%} de brun",
+                          coherence=f.coherence, brown=f.brown)
     if f.periodic > 60 and f.energy > 0.02:
-        return "fabric", f"trame périodique ({f.periodic:.0f})"
+        return "fabric", tr("trame périodique ({periodic:.0f})", periodic=f.periodic)
     if f.sat < 0.2:
-        return "stone", f"saturation faible ({f.sat:.2f})"
-    return "generic", "aucun indice dominant"
+        return "stone", tr("saturation faible ({sat:.2f})", sat=f.sat)
+    return "generic", tr("aucun indice dominant")
 
 
 def decide(img: Image.Image, an: Analysis, name: str, cfg: dict) -> RouteDecision:
@@ -335,7 +337,10 @@ def decide(img: Image.Image, an: Analysis, name: str, cfg: dict) -> RouteDecisio
     f = measure(img)
     fd = f.to_dict()
     if an.normal_map or hints.data:
-        why = "carte de relief probable (normal map)" if an.normal_map else f"donnée technique (nom « {'/'.join(w for w in hints.words if w in DATA_TOKENS)} »)"
+        packed = {"ag": tr(" — X dans l'alpha, Y dans le vert (DXT5nm)"),
+                  "rg": tr(" — X et Y dans le rouge et le vert (BC5)")}.get(an.normal_packing, "")
+        why = (tr("carte de relief probable (normal map)") + packed if an.normal_map else
+               tr("donnée technique (nom « {words} »)", words="/".join(w for w in hints.words if w in DATA_TOKENS)))
         return RouteDecision("local", "data", reason=why, features=fd)
     score, why, kind = _ui_score(f, an, hints, rc)
     # Un nom explicite (hud, font, icon…) l'emporte : les archives extraites nomment leurs fichiers
@@ -343,12 +348,12 @@ def decide(img: Image.Image, an: Analysis, name: str, cfg: dict) -> RouteDecisio
         score = max(score, float(rc["ui_threshold"]))
     if score >= float(rc["ui_threshold"]):
         return RouteDecision("ui", "ui", ui_kind=kind, ui_score=round(score, 3),
-                             reason=f"graphisme plat ({kind}) : " + ", ".join(why), features=fd)
+                             reason=tr("graphisme plat ({kind}) : ", kind=kind) + ", ".join(why), features=fd)
     if an.mode == "upscale":
         return RouteDecision("local", "data", ui_score=round(score, 3), reason=an.reason, features=fd)
     material, mwhy = _material(f, an, hints)
     if material == "skin" and str(rc.get("skin_route", "local")) == "local":
         return RouteDecision("local", "material", material="skin", ui_score=round(score, 3),
-                             reason=f"peau ou visage ({mwhy}) : agrandissement sans IA générative", features=fd)
+                             reason=tr("peau ou visage ({why}) : agrandissement sans IA générative", why=mwhy), features=fd)
     return RouteDecision("comfyui", "material", material=material, ui_score=round(score, 3),
-                         reason=f"matériau {material} ({mwhy})", features=fd)
+                         reason=tr("matériau {material} ({why})", material=material, why=mwhy), features=fd)

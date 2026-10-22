@@ -29,7 +29,8 @@ from PIL import Image
 from . import ddsbuild
 from .events import EventBus
 from .imaging import IMAGE_EXTS, Analysis, SourceTexture, analyze, load_texture, output_scale, save_png
-from .qc import LABELS, QC_VERSION, QCItem, QCResult, run_qc, summarize, to_target
+from .i18n import tr
+from .qc import QC_VERSION, QCItem, QCResult, label_of, run_qc, summarize, to_target
 
 REPORT_NAME = "qc_report.json"
 
@@ -50,6 +51,7 @@ class ExportItem:
     route: str = ""
     row: dict | None = None         # ligne de la base d'état (mode projet)
     dds_format: str | None = None   # format imposé par une règle [[rules]]
+    src_rel: str = ""               # chemin sous le dossier d'entrée (cible « loose » : conservé à l'identique)
 
 
 # ------------------------------------------------------------------ sources des textures
@@ -98,7 +100,7 @@ def items_from_state(cfg: dict, state, only: str | None = None) -> list[ExportIt
             candidate_path=Path(r["result_path"]), source=source, k=k,
             out_rel=str(Path(label) / Path(rel).with_suffix("")), fallback_path=fb,
             reviewed=bool(r.get("reviewed")), data=bool(an.normal_map or an_d.get("category") == "data"),
-            route=route, row=r, dds_format=extra.get("dds_format")))
+            route=route, row=r, dds_format=extra.get("dds_format"), src_rel=rel))
     return items
 
 
@@ -141,7 +143,7 @@ def items_from_folders(cfg: dict, originals: Path, generated: Path, *, include_u
         try:
             tex = load_texture(p)
         except Exception as exc:
-            log(f"  ! {rel} illisible : {exc}")
+            log(tr("  ! {name} illisible : {err}", name=rel, err=exc))
             continue
         an = analyze(tex.image, cfg)
         route = decide(tex.image, an, p.stem, cfg)
@@ -153,10 +155,10 @@ def items_from_folders(cfg: dict, originals: Path, generated: Path, *, include_u
             tid=str(rel).replace("\\", "/"), name=p.stem, src_path=p, an=an, candidate_path=cand,
             source="ai" if cand else "local", k=k, out_rel=str(rel.with_suffix("")),
             data=bool(an.normal_map or route.category == "data"), route=route.route,
-            dds_format=extra.get("dds_format")))
+            dds_format=extra.get("dds_format"), src_rel=str(rel).replace("\\", "/")))
     if missing:
-        log(f"  {missing} original(aux) sans image générée correspondante (ignorés ; --include-unmatched pour "
-            f"les exporter en agrandissement local)")
+        log(tr("  {n} original(aux) sans image générée correspondante (ignorés ; --include-unmatched pour "
+               "les exporter en agrandissement local)", n=missing))
     return items
 
 
@@ -178,8 +180,8 @@ class PostProcessor:
     def __init__(self, cfg: dict, events: EventBus, *, target: str = "none", out_dir: Path | None = None,
                  qc: bool = True, fix: bool | None = None, encoder: str | None = None, state=None,
                  write_state: bool = True) -> None:
-        if target not in ("none", "specialk", "png", "remix"):
-            raise ValueError(f"cible inconnue : {target}")
+        if target not in ("none", "specialk", "loose", "png", "remix"):
+            raise ValueError(tr("cible inconnue : {target}", target=target))
         self.cfg = cfg
         self.ev = events
         self.target = target
@@ -190,7 +192,7 @@ class PostProcessor:
         self.state = state
         self.write_state = write_state and state is not None
         self.encoder = ddsbuild.make_encoder(cfg, encoder, log=lambda m: self.ev.emit("info", message=m)) \
-            if target == "specialk" else None
+            if target in ("specialk", "loose") else None
         self.fp = qc_fingerprint(cfg)
         self.stop_file = Path(cfg["_work"]) / "STOP"
         self.used_names: dict[str, str] = {}
@@ -212,9 +214,9 @@ class PostProcessor:
             else:
                 img, notes = to_target(cand, pr.src.image, it.an, it.k) if cand else (None, [])
                 if img is None:
-                    raise ValueError("aucune image à exporter")
+                    raise ValueError(tr("aucune image à exporter"))
                 pr.qc = QCResult(img, "measured", it.source, warnings=notes)
-            if self.target == "specialk":
+            if self.target in ("specialk", "loose"):
                 fmt, _n = ddsbuild.choose_format(pr.src.fmt, pr.src.is_dds, it.an, self.cfg, data=it.data,
                                                  can_bc7=self._can_bc7(), override=it.dds_format)
                 img, note = ddsbuild.fit_block_size(pr.qc.image, ddsbuild.dds.codec_of(fmt))
@@ -261,7 +263,7 @@ class PostProcessor:
             for start in range(0, total, chunk):
                 if self.stop_file.exists():
                     stopped = True
-                    self.ev.emit("stopped", message="fichier STOP détecté")
+                    self.ev.emit("stopped", message=tr("fichier STOP détecté"))
                     break
                 batch = list(pool.map(self._prepare, items[start:start + chunk]))
                 outputs = self._encode(batch)
@@ -285,8 +287,9 @@ class PostProcessor:
                    "seconds": round(time.monotonic() - t0, 1), "stopped": stopped}
         budget = float(self.cfg["qc"].get("memory_budget_mb", 0) or 0)
         if budget and summary["dds_mb"] > budget:
-            summary["memory_warning"] = (f"{summary['dds_mb']} Mo de textures pour un budget de {budget:.0f} Mo : "
-                                         f"risque de plantage d'un jeu 32 bits (max_side ou scale à réduire)")
+            summary["memory_warning"] = tr("{mb} Mo de textures pour un budget de {budget:.0f} Mo : risque de "
+                                           "plantage d'un jeu 32 bits (max_side ou scale à réduire)",
+                                           mb=summary["dds_mb"], budget=budget)
         report = {
             "generated": time.strftime("%Y-%m-%d %H:%M:%S"), "target": self.target, "encoder": enc_name,
             "qc_enabled": self.do_qc, "fingerprint": self.fp,
@@ -306,7 +309,7 @@ class PostProcessor:
         return report
 
     def _encode(self, batch: list[_Prepared]) -> dict:
-        if self.target != "specialk":
+        if self.target not in ("specialk", "loose"):
             return {}
         todo = {pr.item.tid: (pr.plan, pr.chain) for pr in batch if pr.error is None and pr.plan is not None}
         if not todo:
@@ -319,7 +322,7 @@ class PostProcessor:
         it = pr.item
         entry: dict = {"id": it.tid, "name": it.name, "route": it.route, "source": it.source}
         if pr.error is not None:
-            entry.update(decision="error", label=LABELS["error"], reasons=[pr.error], fixes=[], warnings=[])
+            entry.update(decision="error", label=label_of("error"), reasons=[pr.error], fixes=[], warnings=[])
             self._fail(it, "qc", "error", pr.error, "abandon")
             self.ev.emit("failed", texture=it.tid, name=it.name, stage="qc", kind="error", message=pr.error)
             return entry
@@ -330,7 +333,7 @@ class PostProcessor:
         if self.write_state and not pr.cached:
             self._update_state(it, r)
         output: dict = {}
-        if self.target == "specialk":
+        if self.target in ("specialk", "loose"):
             output = self._write_dds(it, pr, out, entry)
         elif self.target in ("png", "remix"):
             output = self._write_png(it, r.image)
@@ -344,43 +347,48 @@ class PostProcessor:
             ev.update(format=output["format"], levels=output["levels"], encoder=output.get("encoder"),
                       psnr=output.get("psnr_min"))
         if entry["decision"] == "error":
-            ev["decision"], ev["label"] = "error", LABELS["error"]
+            ev["decision"], ev["label"] = "error", label_of("error")
         self.ev.emit("qc_done", **ev)
         return entry
 
     def _write_dds(self, it: ExportItem, pr: _Prepared, out, entry: dict) -> dict:
         assert self.out_dir is not None and pr.plan is not None
         fname = f"{it.name}.dds"
+        if self.target == "loose" and it.src_rel:
+            # même chemin que dans le jeu (Textures/Architecture/…) : le fichier remplace celui de l'archive
+            rel = Path(it.src_rel)
+            fname = (rel if rel.suffix.lower() == ".dds" else rel.with_suffix(".dds")).as_posix()
         with self._lock:
             prev = self.used_names.get(fname.lower())
             if prev is not None:
-                msg = f"nom en double : {fname} ({it.tid} / {prev})"
+                msg = tr("nom en double : {file} ({a} / {b})", file=fname, a=it.tid, b=prev)
                 entry["warnings"].append(msg)
                 return {"skipped": msg}
             self.used_names[fname.lower()] = it.tid
         if out is None or isinstance(out, Exception):
-            msg = f"DDS : {out}" if out is not None else "DDS : aucun résultat d'encodage"
-            entry.update(decision="error", label=LABELS["error"])
+            msg = f"DDS : {out}" if out is not None else tr("DDS : aucun résultat d'encodage")
+            entry.update(decision="error", label=label_of("error"))
             entry["reasons"] = entry.get("reasons", []) + [msg]
             self._fail(it, "dds", "dds", msg, "abandon")
             self.ev.emit("failed", texture=it.tid, name=it.name, stage="dds", kind="dds", message=msg)
             return {"error": msg}
         chk = out.check
         if not chk.get("ok", True):
-            msg = "DDS relu invalide : " + "; ".join(chk.get("errors", []))
-            entry.update(decision="error", label=LABELS["error"])
+            msg = tr("DDS relu invalide : {errors}", errors="; ".join(chk.get("errors", [])))
+            entry.update(decision="error", label=label_of("error"))
             entry["reasons"] = entry.get("reasons", []) + [msg]
             self._fail(it, "dds", "dds", msg, "abandon")
             self.ev.emit("failed", texture=it.tid, name=it.name, stage="dds", kind="dds", message=msg)
             return {"error": msg}
         min_psnr = float(self.cfg["qc"].get("min_psnr", 28))
         if chk.get("psnr_l0") is not None and chk["psnr_l0"] < min_psnr:
-            entry["warnings"].append(f"compression {out.plan.fmt} : PSNR {chk['psnr_l0']:.1f} dB < {min_psnr:.0f} "
-                                     f"(dégradé, texte ou UI : dds_format = \"bgra8\" pour cette texture)")
+            entry["warnings"].append(tr("compression {fmt} : PSNR {psnr:.1f} dB < {lim:.0f} (dégradé, texte ou UI : "
+                                        "dds_format = \"bgra8\" pour cette texture)", fmt=out.plan.fmt,
+                                        psnr=chk["psnr_l0"], lim=min_psnr))
         if chk.get("coverage_drift") is not None and chk["coverage_drift"] > 0.05:
-            entry["warnings"].append(f"couverture alpha des mipmaps : écart {chk['coverage_drift']:.2f}")
+            entry["warnings"].append(tr("couverture alpha des mipmaps : écart {v:.2f}", v=chk["coverage_drift"]))
         if chk.get("brightness_drift") is not None and chk["brightness_drift"] > 0.05:
-            entry["warnings"].append(f"luminosité des mipmaps : écart {chk['brightness_drift']:.0%}")
+            entry["warnings"].append(tr("luminosité des mipmaps : écart {v:.0%}", v=chk["brightness_drift"]))
         path = self.out_dir / fname
         ddsbuild.write_atomic(path, out.data)
         return {"file": fname, "format": out.plan.fmt, "levels": out.plan.levels,
@@ -396,7 +404,7 @@ class PostProcessor:
             fname = f"{it.name}.png"
             with self._lock:
                 if fname.lower() in self.used_names:
-                    return {"skipped": f"nom en double : {fname}"}
+                    return {"skipped": tr("nom en double : {file}", file=fname)}
                 self.used_names[fname.lower()] = it.tid
             dest = self.out_dir / fname
         else:
@@ -436,14 +444,14 @@ def _short(r: QCResult) -> str:
 
 
 def _summary_text(s: dict) -> str:
-    parts = [f"{s['validated']} validée(s)", f"{s['corrected']} corrigée(s)", f"{s['rejected']} rejetée(s)",
-             f"{s['local']} locale(s)"]
+    parts = [tr("{n} validée(s)", n=s["validated"]), tr("{n} corrigée(s)", n=s["corrected"]),
+             tr("{n} rejetée(s)", n=s["rejected"]), tr("{n} locale(s)", n=s["local"])]
     if s.get("measured"):
-        parts.append(f"{s['measured']} mesurée(s) (choix manuel ou QC désactivé)")
+        parts.append(tr("{n} mesurée(s) (choix manuel ou QC désactivé)", n=s["measured"]))
     if s.get("error"):
-        parts.append(f"{s['error']} erreur(s)")
+        parts.append(tr("{n} erreur(s)", n=s["error"]))
     txt = ", ".join(parts)
     if s.get("dds_mb"):
         ratio = f", ×{s['dds_mb'] / s['original_mb']:.1f}" if s.get("original_mb") else ""
-        txt += f" — DDS {s['dds_mb']} Mo (originaux {s['original_mb']} Mo{ratio})"
+        txt += tr(" — DDS {mb} Mo (originaux {orig} Mo{ratio})", mb=s["dds_mb"], orig=s["original_mb"], ratio=ratio)
     return txt

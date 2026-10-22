@@ -79,6 +79,10 @@ def cmd_doctor(args) -> int:
     up = UiUpscaler(cfg)
     print(f"  · moteurs UI disponibles : {', '.join(up.available())}"
           + ("" if len(up.available()) > 1 else "  (configure realesrgan_exe pour un meilleur résultat)"))
+    from .esrgan import find_realesrgan
+    esr = find_realesrgan(cfg)
+    print(f"  ✓ Real-ESRGAN : {esr} (mode sans ComfyUI, UI, replis)" if esr else
+          "  · Real-ESRGAN absent : python -m texforge install-realesrgan (45 Mo, version officielle)")
     from .ddsbuild import find_texconv
     tx = find_texconv(cfg)
     if tx:
@@ -386,15 +390,121 @@ def cmd_selftest(args) -> int:
     return selftest_main()
 
 
+def cmd_install_realesrgan(args) -> int:
+    """Télécharge realesrgan-ncnn-vulkan (version officielle, empreinte vérifiée) dans tools/."""
+    from .esrgan import INSTALL_DIR, RELEASES, EsrganError, find_realesrgan, install_realesrgan, platform_key
+    from .i18n import tr
+    found = find_realesrgan()
+    if found and not args.force:
+        print(tr("Real-ESRGAN déjà présent : {path}", path=found))
+        return 0
+    name, size, _sha = RELEASES[platform_key()]
+    print(tr("Téléchargement de {name} ({mb:.0f} Mo) depuis GitHub (xinntao/Real-ESRGAN)…", name=name, mb=size / 2 ** 20))
+    last = [0]
+
+    def progress(done: int, total: int) -> None:
+        pct = int(done * 100 / total) if total else 0
+        if pct >= last[0] + 10:
+            last[0] = pct - pct % 10
+            print(f"  {last[0]} %", flush=True)
+    try:
+        exe = install_realesrgan(INSTALL_DIR, progress)
+    except EsrganError as exc:
+        print(f"✗ {exc}")
+        return 1
+    print(tr("✓ Real-ESRGAN installé : {path}", path=exe))
+    return 0
+
+
+def cmd_detect(args) -> int:
+    """Dossiers de textures extraites trouvés automatiquement (Special K, RTX Remix)."""
+    import json
+    import time
+    from .detect import detect
+    from .i18n import tr
+    t0 = time.monotonic()
+    cands = detect(history=args.path or [])
+    if args.json:
+        print(json.dumps([c.to_dict() for c in cands], ensure_ascii=False, indent=1))
+        return 0 if cands else 1
+    if not cands:
+        print(tr("Aucun dossier de textures extraites trouvé ({seconds:.1f} s).", seconds=time.monotonic() - t0))
+        print(tr("Special K : active le dump des textures en jeu ; sinon indique le dossier à la main "
+                 "ou ajoute ta bibliothèque de jeux dans TEXFORGE_SEARCH."))
+        return 1
+    print(tr("{n} dossier(s) trouvé(s) en {seconds:.1f} s, du plus récent au plus ancien :",
+             n=len(cands), seconds=time.monotonic() - t0))
+    for c in cands:
+        when = time.strftime("%Y-%m-%d %H:%M", time.localtime(c.newest)) if c.newest else "-"
+        print(f"  {c.game}  [{'Special K' if c.kind == 'specialk' else 'RTX Remix'}, {c.source}] — "
+              + tr("{count} texture(s), dernière le {when}", count=c.count, when=when))
+        print(f"      {c.path}")
+        if c.inject:
+            print("      " + tr("injection : {path}", path=c.inject))
+    return 0
+
+
+def cmd_ba2(args) -> int:
+    """Archives BA2 : liste des textures (filtrées) ou extraction en fichiers DDS."""
+    from .ba2 import Ba2Archive, Ba2Error, data_folder, extract_textures, matches, parse_patterns, texture_archives
+    from .i18n import tr
+    p = Path(args.path)
+    if args.action == "extract":
+        if not args.dest:
+            print(tr("✗ extract : indique le dossier de destination"), file=sys.stderr)
+            return 2
+        folder = data_folder(p) or p
+        c = extract_textures(folder, Path(args.dest), include=args.filter, log=print)
+        print(tr("{written} texture(s) extraite(s), {kept} déjà là, {selected} retenue(s) sur {listed}", **c))
+        return 0 if c["selected"] else 1
+    arcs = [p] if p.is_file() else texture_archives(data_folder(p) or p)
+    pats = parse_patterns(args.filter)
+    shown = 0
+    for a in arcs:
+        try:
+            with Ba2Archive(a) as b:
+                print(f"{a.name} — v{b.version} {b.kind} {b.compression}, {len(b.textures) or len(b.files)}")
+                for t in b.textures:
+                    if matches(t.name, pats):
+                        shown += 1
+                        print(f"  {t.name}  {t.width}x{t.height}  DXGI {t.dxgi}  {t.mips} mip(s)"
+                              + ("  cubemap" if t.cubemap else ""))
+        except Ba2Error as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+    print(tr("{n} texture(s) selon le filtre", n=shown))
+    return 0
+
+
+def _take_lang(args: list[str]) -> list[str]:
+    """--lang fr|en, n'importe où dans la ligne : langue des messages (retirée avant l'analyse)."""
+    from .i18n import set_lang
+    out: list[str] = []
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == "--lang" and i + 1 < len(args):
+            set_lang(args[i + 1])
+            i += 2
+            continue
+        if a.startswith("--lang="):
+            set_lang(a.split("=", 1)[1])
+        else:
+            out.append(a)
+        i += 1
+    return out
+
+
 def main(argv=None) -> int:
     _utf8_console()
-    args_in = list(sys.argv[1:] if argv is None else argv)
+    args_in = _take_lang(list(sys.argv[1:] if argv is None else argv))
     if args_in and args_in[0] == "remaster":          # chaîne complète (interface graphique, scripts)
         from .remaster import main as remaster_main
         return remaster_main(args_in[1:])
     p = argparse.ArgumentParser(prog="texforge", description="Remaster des textures de jeux anciens : UI locale + ComfyUI")
     p.add_argument("--config", default="texforge.toml", help="fichier de configuration (défaut : ./texforge.toml)")
     p.add_argument("--version", action="version", version=f"TEXFORGE {__version__}")
+    p.add_argument("--lang", choices=["fr", "en"],
+                   help="langue des messages / message language (défaut : TEXFORGE_LANG ou langue du système)")
     sub = p.add_subparsers(dest="cmd", required=True)
 
     s = sub.add_parser("init", help="créer une configuration d'exemple")
@@ -407,7 +517,8 @@ def main(argv=None) -> int:
     s.set_defaults(fn=cmd_route)
     sub.add_parser("estimate", help="estimer la durée (ComfyUI) ou le coût (cloud)").set_defaults(fn=cmd_estimate)
     s = sub.add_parser("run", help="traiter : UI, local, puis ComfyUI")
-    s.add_argument("--provider", choices=["comfyui", "mock", "higgsfield"], help="remplace le fournisseur de la config")
+    s.add_argument("--provider", choices=["comfyui", "esrgan", "mock", "higgsfield"],
+                   help="remplace le fournisseur de la config (esrgan : sans ComfyUI)")
     s.add_argument("--stage", action="append", choices=["ui", "local", "ai"], help="limiter à une étape (répétable)")
     s.add_argument("--json-events", action="store_true", help="événements JSON sur la sortie standard (pont Node.js)")
     s.add_argument("--verbose", action="store_true", help="afficher aussi le routage de chaque texture")
@@ -445,7 +556,7 @@ def main(argv=None) -> int:
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_qc)
     s = sub.add_parser("export", help="contrôle qualité puis écriture des textures finales (DDS + mipmaps)")
-    s.add_argument("--target", choices=["specialk", "png", "remix"], required=True)
+    s.add_argument("--target", choices=["specialk", "loose", "png", "remix"], required=True)
     s.add_argument("--out", required=True, help="dossier de sortie")
     s.add_argument("--encoder", choices=["auto", "texconv", "builtin"], help="compresseur DDS (défaut : [qc] encoder)")
     s.add_argument("--dds-format", choices=["match", "auto", "dxt1", "dxt5", "bgra8", "bc7"],
@@ -464,7 +575,7 @@ def main(argv=None) -> int:
     s.add_argument("--originals", required=True, help="dossier des textures d'origine (DDS, PNG…)")
     s.add_argument("--generated", required=True, help="dossier des images générées (sortie ComfyUI)")
     s.add_argument("--out", required=True, help="dossier de sortie (DDS + qc_report.json)")
-    s.add_argument("--target", choices=["specialk", "png", "remix"], default="specialk")
+    s.add_argument("--target", choices=["specialk", "loose", "png", "remix"], default="specialk")
     s.add_argument("--encoder", choices=["auto", "texconv", "builtin"])
     s.add_argument("--dds-format", choices=["match", "auto", "dxt1", "dxt5", "bgra8", "bc7"])
     s.add_argument("--target-api", choices=["d3d9", "d3d10", "d3d11"])
@@ -476,6 +587,20 @@ def main(argv=None) -> int:
     s.add_argument("--quiet", action="store_true")
     s.set_defaults(fn=cmd_postprocess)
     sub.add_parser("selftest", help="test complet avec textures synthétiques (gratuit)").set_defaults(fn=cmd_selftest)
+    s = sub.add_parser("install-realesrgan", help="télécharger Real-ESRGAN (mode sans ComfyUI, 45 Mo)")
+    s.add_argument("--force", action="store_true", help="réinstaller même s'il est déjà présent")
+    s.set_defaults(fn=cmd_install_realesrgan)
+    s = sub.add_parser("detect", help="trouver les dossiers de textures extraites (Special K, RTX Remix)")
+    s.add_argument("path", nargs="*", help="dossiers de jeux à inclure dans la recherche")
+    s.add_argument("--json", action="store_true", help="résultat en JSON")
+    s.set_defaults(fn=cmd_detect)
+
+    s = sub.add_parser("ba2", help="archives BA2 (Fallout 4, Starfield) : lister ou extraire les textures")
+    s.add_argument("action", choices=["list", "extract"])
+    s.add_argument("path", help="archive .ba2, dossier Data ou dossier du jeu")
+    s.add_argument("dest", nargs="?", help="extract : dossier de destination")
+    s.add_argument("--filter", default="*_d.dds", help="motifs séparés par « ; » (vide : toutes les textures)")
+    s.set_defaults(fn=cmd_ba2)
 
     args = p.parse_args(args_in)
     try:

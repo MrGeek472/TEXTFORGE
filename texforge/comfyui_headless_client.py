@@ -46,6 +46,8 @@ import aiohttp
 from PIL import Image
 from tqdm import tqdm
 
+from .i18n import tr
+
 # --------------------------------------------------------------------------- constantes
 
 DEFAULT_COMFY_URL = "http://127.0.0.1:8188"
@@ -126,7 +128,7 @@ def parse_json(body: bytes, what: str) -> Any:
     try:
         return json.loads(body.decode("utf-8"))
     except (UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise TextureError(f"réponse JSON invalide pour {what} : {body[:200]!r}", kind="http") from exc
+        raise TextureError(tr("réponse JSON invalide pour {what} : {body!r}", what=what, body=body[:200]), kind="http") from exc
 
 
 def _gb(n: Any) -> str:
@@ -143,7 +145,7 @@ def load_source_image(path: Path) -> Image.Image:
             alpha = "A" in im.getbands() or im.info.get("transparency") is not None
             return im.convert("RGBA" if alpha else "RGB")
     except Exception as exc:  # fichier corrompu ou format non géré par Pillow
-        raise TextureError(f"image illisible : {exc}", kind="image") from exc
+        raise TextureError(tr("image illisible : {exc}", exc=exc), kind="image") from exc
 
 
 def png_bytes(img: Image.Image) -> bytes:
@@ -169,7 +171,7 @@ def save_outputs(blobs: list[bytes], source: Image.Image, dest: Path, keep_alpha
                 im.load()
                 out = im.convert("RGB")
         except Exception as exc:
-            raise TextureError(f"image renvoyée illisible : {exc}", kind="http") from exc
+            raise TextureError(tr("image renvoyée illisible : {exc}", exc=exc), kind="http") from exc
         if keep_alpha and has_alpha(source):
             out = out.convert("RGBA")
             out.putalpha(source.getchannel("A").resize(out.size, Image.Resampling.LANCZOS))
@@ -214,19 +216,22 @@ class ComfyWorkflow:
         try:
             raw = json.loads(Path(path).read_text(encoding="utf-8"))
         except FileNotFoundError:
-            raise WorkflowError(f"workflow introuvable : {path}") from None
+            raise WorkflowError(tr("workflow introuvable : {path}", path=path)) from None
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"JSON invalide dans {path} (ligne {exc.lineno}) : {exc.msg}") from None
+            raise WorkflowError(tr("JSON invalide dans {path} (ligne {lineno}) : {msg}",
+                                   path=path, lineno=exc.lineno, msg=exc.msg)) from None
         if isinstance(raw, dict) and isinstance(raw.get("prompt"), dict):
             raw = raw["prompt"]   # accepte aussi un corps de requête /prompt complet
         if isinstance(raw, dict) and "nodes" in raw and "links" in raw:
-            raise WorkflowError("ce fichier est au format « interface » de ComfyUI : "
-                                "réexporte-le avec Workflow → Export (API)")
+            raise WorkflowError(tr("ce fichier est au format « interface » de ComfyUI : "
+                                "réexporte-le avec Workflow → Export (API)"))
         if not isinstance(raw, dict) or not raw:
-            raise WorkflowError("workflow vide ou mal formé (objet JSON attendu)")
+            raise WorkflowError(tr("workflow vide ou mal formé (objet JSON attendu)"))
         for nid, node in raw.items():
             if not isinstance(node, dict) or "class_type" not in node or not isinstance(node.get("inputs"), dict):
-                raise WorkflowError(f"nœud {nid!r} mal formé : « class_type » et « inputs » attendus (format API)")
+                raise WorkflowError(tr("nœud {nid!r} mal formé : « class_type » et « inputs » attendus (format "
+                                       "API)",
+                                       nid=nid))
         graph: dict[str, dict[str, Any]] = raw
 
         def title(nid: str) -> str:
@@ -236,17 +241,18 @@ class ComfyWorkflow:
         loads = [nid for nid, n in graph.items() if n["class_type"] in LOAD_IMAGE_TYPES]
         if load_node_id is not None:
             if load_node_id not in graph:
-                raise WorkflowError(f"nœud d'entrée {load_node_id!r} absent du workflow")
+                raise WorkflowError(tr("nœud d'entrée {load_node_id!r} absent du workflow",
+                                       load_node_id=load_node_id))
             chosen = load_node_id
         elif len(loads) == 1:
             chosen = loads[0]
         elif not loads:
-            raise WorkflowError("aucun nœud LoadImage dans le workflow")
+            raise WorkflowError(tr("aucun nœud LoadImage dans le workflow"))
         else:
             tagged = [nid for nid in loads if INPUT_TITLE_TAG.lower() in title(nid).lower()]
             if len(tagged) != 1:
-                raise WorkflowError(f"plusieurs nœuds LoadImage ({', '.join(loads)}) : renomme celui de la "
-                                    f"texture « {INPUT_TITLE_TAG} » ou passe --load-node ID")
+                raise WorkflowError(tr("plusieurs nœuds LoadImage ({nodes}) : renomme celui de la texture « {tag} » ou passe "
+                                       "--load-node ID", nodes=", ".join(loads), tag=INPUT_TITLE_TAG))
             chosen = tagged[0]
 
         # Nœuds de sortie
@@ -254,7 +260,7 @@ class ComfyWorkflow:
         if output_node_ids:
             missing = [n for n in output_node_ids if n not in graph]
             if missing:
-                raise WorkflowError(f"nœud(s) de sortie absent(s) : {', '.join(missing)}")
+                raise WorkflowError(tr("nœud(s) de sortie absent(s) : {nodes}", nodes=", ".join(missing)))
             outs = list(output_node_ids)
         else:
             saves = [nid for nid, n in graph.items() if n["class_type"] in SAVE_IMAGE_TYPES]
@@ -264,8 +270,8 @@ class ComfyWorkflow:
                 outs = [nid for nid, n in graph.items() if n["class_type"] in PREVIEW_IMAGE_TYPES]
                 preview_only = True
                 if not outs:
-                    raise WorkflowError("aucun nœud SaveImage (ni PreviewImage) : le workflow ne produit rien")
-                log.warning("pas de SaveImage : lecture depuis le dossier temporaire de ComfyUI (PreviewImage)")
+                    raise WorkflowError(tr("aucun nœud SaveImage (ni PreviewImage) : le workflow ne produit rien"))
+                log.warning(tr("pas de SaveImage : lecture depuis le dossier temporaire de ComfyUI (PreviewImage)"))
         return cls(graph, chosen, outs, preview_only)
 
     def build(self, image_name: str, filename_prefix: str, overrides: Overrides | None = None,
@@ -295,8 +301,9 @@ class ComfyWorkflow:
         if len(hits) == 1:
             return hits[0]
         if hits:
-            raise WorkflowError(f"--set : plusieurs nœuds portent le titre {ref!r} ({', '.join(hits)})")
-        raise WorkflowError(f"--set : aucun nœud d'id ou de titre {ref!r} dans le workflow")
+            raise WorkflowError(tr("--set : plusieurs nœuds portent le titre {ref!r} ({nodes})",
+                                   ref=ref, nodes=", ".join(hits)))
+        raise WorkflowError(tr("--set : aucun nœud d'id ou de titre {ref!r} dans le workflow", ref=ref))
 
     def node_label(self, nid: Any) -> str:
         node = self.graph.get(str(nid)) or {}
@@ -320,7 +327,7 @@ class HttpBackend(abc.ABC):
     @property
     def session(self) -> aiohttp.ClientSession:
         if self._session is None:
-            raise RuntimeError("moteur non démarré (appeler start())")
+            raise RuntimeError(tr("moteur non démarré (appeler start())"))
         return self._session
 
     async def start(self) -> None:
@@ -337,11 +344,12 @@ class HttpBackend(abc.ABC):
             async with self.session.request(method, self.base_url + path, **kwargs) as resp:
                 return resp.status, await resp.read()
         except (aiohttp.ClientConnectorError, aiohttp.ServerDisconnectedError, aiohttp.ClientOSError) as exc:
-            raise ServerUnavailable(f"{self.label} injoignable ({self.base_url}) : {exc}") from exc
+            raise ServerUnavailable(tr("{label} injoignable ({base_url}) : {exc}",
+                                       label=self.label, base_url=self.base_url, exc=exc)) from exc
         except asyncio.TimeoutError as exc:
-            raise TextureError(f"{method} {path} : délai réseau dépassé", kind="timeout") from exc
+            raise TextureError(tr("{method} {path} : délai réseau dépassé", method=method, path=path), kind="timeout") from exc
         except aiohttp.ClientPayloadError as exc:
-            raise TextureError(f"{method} {path} : réponse tronquée ({exc})", kind="http") from exc
+            raise TextureError(tr("{method} {path} : réponse tronquée ({exc})", method=method, path=path, exc=exc), kind="http") from exc
 
     def _emit(self, text: str) -> None:
         if self.on_progress is not None:
@@ -420,7 +428,7 @@ class ComfyUIBackend(HttpBackend):
     async def check_ready(self) -> str:
         status, body = await self._request("GET", "/system_stats")
         if status != 200:
-            raise ServerUnavailable(f"/system_stats a répondu {status} : est-ce bien ComfyUI ?")
+            raise ServerUnavailable(tr("/system_stats a répondu {status} : est-ce bien ComfyUI ?", status=status))
         try:
             stats = parse_json(body, "/system_stats")
         except TextureError as exc:
@@ -430,9 +438,10 @@ class ComfyUIBackend(HttpBackend):
         # laisse au WebSocket le temps de s'ouvrir avant la première requête
         with contextlib.suppress(asyncio.TimeoutError):
             await asyncio.wait_for(self._ws_connected.wait(), timeout=5)
-        ws = "WebSocket connecté" if self._ws_connected.is_set() else "WebSocket indisponible (suivi par sondage)"
-        return (f"ComfyUI {version} — {dev.get('name', 'GPU ?')}, VRAM libre "
-                f"{_gb(dev.get('vram_free'))}/{_gb(dev.get('vram_total'))} Go — {ws}")
+        ws = tr("WebSocket connecté") if self._ws_connected.is_set() else tr("WebSocket indisponible (suivi par sondage)")
+        return (tr("ComfyUI {version} — {gpu}, VRAM libre {free}/{total} Go — {ws}",
+                   version=version, gpu=dev.get("name", "GPU ?"), free=_gb(dev.get("vram_free")),
+                   total=_gb(dev.get("vram_total")), ws=ws))
 
     async def vram_free_bytes(self) -> int | None:
         status, body = await self._request("GET", "/system_stats")
@@ -445,7 +454,7 @@ class ComfyUIBackend(HttpBackend):
         """Décharge les modèles et vide le cache CUDA (appliqué par ComfyUI entre deux requêtes)."""
         status, _ = await self._request("POST", "/free", json={"unload_models": True, "free_memory": True})
         if status != 200:
-            log.warning("/free a répondu %s", status)
+            log.warning(tr("/free a répondu %s"), status)
 
     # ---------------------------------------------------------------- génération
     async def generate(self, source: Image.Image, stem: str, *, overrides: Overrides | None = None,
@@ -474,7 +483,7 @@ class ComfyUIBackend(HttpBackend):
             self._trackers.pop(pid, None)
             self._retired.add(pid)
         if not images:
-            raise TextureError("le workflow n'a produit aucune image", kind="workflow")
+            raise TextureError(tr("le workflow n'a produit aucune image"), kind="workflow")
         return images
 
     async def cancel_pending(self) -> None:
@@ -489,11 +498,11 @@ class ComfyUIBackend(HttpBackend):
         form.add_field("overwrite", "true")
         status, body = await self._request("POST", "/upload/image", data=form)
         if status != 200:
-            raise TextureError(f"envoi de l'image refusé ({status}) : {body[:200]!r}", kind="http")
+            raise TextureError(tr("envoi de l'image refusé ({status}) : {body!r}", status=status, body=body[:200]), kind="http")
         info = parse_json(body, "/upload/image")
         name, sub = info.get("name"), info.get("subfolder") or ""
         if not name:
-            raise TextureError("réponse /upload/image sans nom de fichier", kind="http")
+            raise TextureError(tr("réponse /upload/image sans nom de fichier"), kind="http")
         # LoadImage attend un chemin relatif au dossier input de ComfyUI
         return f"{sub}/{name}" if sub else str(name)
 
@@ -512,11 +521,11 @@ class ComfyUIBackend(HttpBackend):
             details = json.dumps(data, ensure_ascii=False, indent=1) if data else body.decode("utf-8", "replace")
             raise WorkflowError(describe_prompt_error(status, data, body), details=details)
         if data.get("node_errors"):
-            log.warning("sorties partiellement invalides : %s", describe_prompt_error(status, data, body))
+            log.warning(tr("sorties partiellement invalides : %s"), describe_prompt_error(status, data, body))
         pid = data.get("prompt_id")
         if not isinstance(pid, str):
             self._trackers.pop(wanted, None)
-            raise TextureError("réponse /prompt sans prompt_id", kind="http")
+            raise TextureError(tr("réponse /prompt sans prompt_id"), kind="http")
         if pid != wanted:   # ancienne version de ComfyUI qui ignore l'identifiant fourni
             self._trackers[pid] = self._trackers.pop(wanted) if wanted in self._trackers else _PromptTracker()
         return pid
@@ -530,7 +539,7 @@ class ComfyUIBackend(HttpBackend):
             remaining = deadline - loop.time()
             if remaining <= 0:
                 await self._cancel_prompt(pid)
-                raise TextureError(f"délai de {self.timeout:.0f} s dépassé (requête annulée)", kind="timeout")
+                raise TextureError(tr("délai de {timeout:.0f} s dépassé (requête annulée)", timeout=self.timeout), kind="timeout")
             with contextlib.suppress(asyncio.TimeoutError):
                 await asyncio.wait_for(tracker.done.wait(), timeout=min(2.0, remaining))
             if tracker.done.is_set():
@@ -582,7 +591,8 @@ class ComfyUIBackend(HttpBackend):
     async def _download(self, ref: dict[str, str]) -> bytes:
         status, body = await self._request("GET", "/view", params=ref)
         if status != 200 or not body:
-            raise TextureError(f"téléchargement de {ref['filename']} impossible ({status})", kind="http")
+            raise TextureError(tr("téléchargement de {filename} impossible ({status})",
+                                  filename=ref['filename'], status=status), kind="http")
         return body
 
     async def _cancel_prompt(self, pid: str) -> None:
@@ -626,7 +636,7 @@ class ComfyUIBackend(HttpBackend):
                 self._ws_connected.clear()
             if self._closing:
                 return
-            log.debug("WebSocket fermé, reconnexion dans %.0f s", backoff)
+            log.debug(tr("WebSocket fermé, reconnexion dans %.0f s"), backoff)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, 15.0)
 
@@ -667,18 +677,19 @@ class ComfyUIBackend(HttpBackend):
         elif mtype == "execution_error":
             tracker.finish(error=data)
         elif mtype == "execution_interrupted":
-            tracker.finish(error={"exception_type": "Interrupted", "exception_message": "exécution interrompue",
+            tracker.finish(error={"exception_type": "Interrupted", "exception_message": tr("exécution interrompue"),
                                   **data})
 
     def _progress(self, text: str) -> None:
-        queue = f" · file {self._queue_remaining}" if self._queue_remaining else ""
+        queue = tr(" · file {n}", n=self._queue_remaining) if self._queue_remaining else ""
         self._emit(text + queue)
 
 
 def describe_prompt_error(status: int, data: Any, body: bytes) -> str:
     """Résumé lisible d'un refus de /prompt (validation du graphe)."""
     if not isinstance(data, dict):
-        return f"/prompt a répondu {status} : {body[:300].decode('utf-8', 'replace')}"
+        return tr("/prompt a répondu {status} : {body}",
+                  status=status, body=body[:300].decode("utf-8", "replace"))
     parts: list[str] = []
     err = data.get("error")
     if isinstance(err, dict):
@@ -689,23 +700,24 @@ def describe_prompt_error(status: int, data: Any, body: bytes) -> str:
         parts.append(str(err))
     for nid, node_err in (data.get("node_errors") or {}).items():
         for e in (node_err or {}).get("errors", []):
-            parts.append(f"nœud {nid} ({node_err.get('class_type', '?')}) : "
-                         f"{e.get('message', '')} {e.get('details', '')}".strip())
-    return f"workflow refusé ({status}) : " + " | ".join(parts or ["raison inconnue"])
+            parts.append(tr("nœud {nid} ({cls}) : {message} {details}",
+                            nid=nid, cls=node_err.get("class_type", "?"), message=e.get("message", ""),
+                            details=e.get("details", "")).strip())
+    return tr("workflow refusé ({status}) : ", status=status) + " | ".join(parts or [tr("raison inconnue")])
 
 
 def error_from_history(status: dict[str, Any]) -> dict[str, Any]:
     for item in status.get("messages") or []:
         if isinstance(item, (list, tuple)) and len(item) == 2 and item[0] == "execution_error":
             return dict(item[1])
-    return {"exception_type": "Error", "exception_message": "échec signalé dans l'historique (voir console ComfyUI)"}
+    return {"exception_type": "Error", "exception_message": tr("échec signalé dans l'historique (voir console ComfyUI)")}
 
 
 def texture_error_from_comfy(err: dict[str, Any]) -> TextureError:
     etype = str(err.get("exception_type") or "Error")
     emsg = str(err.get("exception_message") or "").strip()
     node = err.get("node_id")
-    where = f" — nœud {node} ({err.get('node_type', '?')})" if node else ""
+    where = tr(" — nœud {node} ({kind})", node=node, kind=err.get("node_type", "?")) if node else ""
     tb = err.get("traceback")
     details = "".join(tb) if isinstance(tb, list) else str(tb or "")
     kind = "interrupted" if etype == "Interrupted" else classify_failure(f"{etype} {emsg}")
@@ -733,29 +745,30 @@ class SDWebUIBackend(HttpBackend):
         try:
             data = json.loads(Path(path).read_text(encoding="utf-8"))
         except FileNotFoundError:
-            raise WorkflowError(f"paramètres introuvables : {path}") from None
+            raise WorkflowError(tr("paramètres introuvables : {path}", path=path)) from None
         except json.JSONDecodeError as exc:
-            raise WorkflowError(f"JSON invalide dans {path} (ligne {exc.lineno}) : {exc.msg}") from None
+            raise WorkflowError(tr("JSON invalide dans {path} (ligne {lineno}) : {msg}",
+                                   path=path, lineno=exc.lineno, msg=exc.msg)) from None
         if not isinstance(data, dict):
-            raise WorkflowError("paramètres img2img : objet JSON attendu")
+            raise WorkflowError(tr("paramètres img2img : objet JSON attendu"))
         if any(isinstance(v, dict) and "class_type" in v for v in data.values()):
-            raise WorkflowError("ce fichier est un workflow ComfyUI : utilise --backend comfyui")
+            raise WorkflowError(tr("ce fichier est un workflow ComfyUI : utilise --backend comfyui"))
         data.pop("init_images", None)
         return data
 
     async def check_ready(self) -> str:
         status, _ = await self._request("GET", "/sdapi/v1/progress?skip_current_image=true")
         if status == 404:
-            raise ServerUnavailable("API absente : relance la WebUI avec l'option --api")
+            raise ServerUnavailable(tr("API absente : relance la WebUI avec l'option --api"))
         if status != 200:
-            raise ServerUnavailable(f"/sdapi/v1/progress a répondu {status}")
+            raise ServerUnavailable(tr("/sdapi/v1/progress a répondu {status}", status=status))
         model = "?"
         with contextlib.suppress(Exception):
             st, body = await self._request("GET", "/sdapi/v1/options")
             if st == 200:
                 model = str(json.loads(body).get("sd_model_checkpoint", "?"))
         free = await self.vram_free_bytes()
-        return f"SD WebUI — modèle {model}, VRAM libre {_gb(free)} Go"
+        return tr("SD WebUI — modèle {model}, VRAM libre {free} Go", model=model, free=_gb(free))
 
     async def vram_free_bytes(self) -> int | None:
         with contextlib.suppress(TextureError):
@@ -771,13 +784,13 @@ class SDWebUIBackend(HttpBackend):
         if status == 200:
             self._needs_reload = True
         else:
-            log.warning("/sdapi/v1/unload-checkpoint a répondu %s", status)
+            log.warning(tr("/sdapi/v1/unload-checkpoint a répondu %s"), status)
 
     async def generate(self, source: Image.Image, stem: str) -> list[bytes]:
         if self._needs_reload:
             status, _ = await self._request("POST", "/sdapi/v1/reload-checkpoint")
             if status != 200:
-                raise TextureError(f"rechargement du modèle impossible ({status})", kind="http")
+                raise TextureError(tr("rechargement du modèle impossible ({status})", status=status), kind="http")
             self._needs_reload = False
         payload = copy.deepcopy(self.params)
         payload["init_images"] = [base64.b64encode(png_bytes(source.convert("RGB"))).decode("ascii")]
@@ -800,7 +813,7 @@ class SDWebUIBackend(HttpBackend):
                 timeout=self.timeout)
         except asyncio.TimeoutError:
             await self.cancel_pending()
-            raise TextureError(f"délai de {self.timeout:.0f} s dépassé (génération interrompue)",
+            raise TextureError(tr("délai de {timeout:.0f} s dépassé (génération interrompue)", timeout=self.timeout),
                                kind="timeout") from None
         except asyncio.CancelledError:
             with contextlib.suppress(Exception):
@@ -815,7 +828,7 @@ class SDWebUIBackend(HttpBackend):
             raise sd_error(status, body)
         images = parse_json(body, "/sdapi/v1/img2img").get("images") or []
         if not images:
-            raise TextureError("la WebUI n'a renvoyé aucune image", kind="http")
+            raise TextureError(tr("la WebUI n'a renvoyé aucune image"), kind="http")
         out: list[bytes] = []
         for b64 in images[:expected]:   # au-delà : cartes ControlNet ajoutées par les extensions
             if "," in b64[:100]:
@@ -836,11 +849,11 @@ class SDWebUIBackend(HttpBackend):
                     continue
                 d = json.loads(body)
                 state = d.get("state") or {}
-                step = (f" · pas {state.get('sampling_step')}/{state.get('sampling_steps')}"
+                step = (tr(" · pas {step}/{steps}", step=state.get("sampling_step"), steps=state.get("sampling_steps"))
                         if state.get("sampling_steps") else "")
                 eta = d.get("eta_relative")
                 self._emit(f"{float(d.get('progress') or 0) * 100:.0f}%{step}"
-                           + (f" · reste ~{eta:.0f} s" if isinstance(eta, (int, float)) and eta > 0 else ""))
+                           + (tr(" · reste ~{eta:.0f} s", eta=eta) if isinstance(eta, (int, float)) and eta > 0 else ""))
 
 
 def sd_error(status: int, body: bytes) -> TextureError:
@@ -854,10 +867,10 @@ def sd_error(status: int, body: bytes) -> TextureError:
     else:
         msg = text[:300]
     if status == 422:
-        return WorkflowError(f"paramètres refusés par la WebUI (422) : {msg}", details=text)
+        return WorkflowError(tr("paramètres refusés par la WebUI (422) : {msg}", msg=msg), details=text)
     if status == 404:
-        return WorkflowError("point d'accès introuvable (404) : lance la WebUI avec --api", details=text)
-    return TextureError(f"erreur WebUI ({status}) : {msg}", kind=classify_failure(msg), details=text)
+        return WorkflowError(tr("point d'accès introuvable (404) : lance la WebUI avec --api"), details=text)
+    return TextureError(tr("erreur WebUI ({status}) : {msg}", status=status, msg=msg), kind=classify_failure(msg), details=text)
 
 
 # --------------------------------------------------------------------------- lot
@@ -1057,7 +1070,7 @@ def make_backend(backend: BackendName, workflow_json_path: str | Path, server_ur
         params = SDWebUIBackend.load_params(Path(workflow_json_path))
         return SDWebUIBackend(server_url or DEFAULT_SD_URL, params, timeout=timeout, long_side=sd_long_side,
                               tiling=sd_tiling, randomize_seed=randomize_seed)
-    raise ValueError(f"moteur inconnu : {backend}")
+    raise ValueError(tr("moteur inconnu : {backend}", backend=backend))
 
 
 async def process_texture_batch_async(
@@ -1095,7 +1108,7 @@ async def process_texture_batch_async(
     errlog, handler = _open_error_log(log_path)
     try:
         if not in_root.is_dir():
-            report.aborted = f"dossier d'entrée introuvable : {in_root}"
+            report.aborted = tr("dossier d'entrée introuvable : {in_root}", in_root=in_root)
             errlog.error("CONFIG | %s", report.aborted)
             log.error(report.aborted)
             return report
@@ -1105,7 +1118,7 @@ async def process_texture_batch_async(
                                   output_node_ids=output_node_ids, randomize_seed=randomize_seed,
                                   sd_long_side=sd_long_side, sd_tiling=sd_tiling)
         except WorkflowError as exc:
-            report.aborted = f"workflow invalide : {exc}"
+            report.aborted = tr("workflow invalide : {exc}", exc=exc)
             errlog.error("CONFIG | %s | %s", workflow_json_path, exc)
             log.error(report.aborted)
             return report
