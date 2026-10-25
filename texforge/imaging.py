@@ -358,7 +358,7 @@ class PrepInfo:
     padded_w: int
     padded_h: int
     aspect_ratio: str
-    fit: str                 # "stretch" | "pad"
+    fit: str                 # "stretch" | "pad" | "tiled" (taille finale, générée par morceaux)
     rect: tuple              # zone utile normalisée (x0, y0, x1, y1) dans l'image envoyée
     input_w: int
     input_h: int
@@ -416,6 +416,61 @@ def prepare_native(img: Image.Image, an: Analysis) -> tuple[Image.Image, PrepInf
     return base.convert("RGB"), PrepInfo(w, h, 0, 0, w, h, "1:1", "stretch", (0.0, 0.0, 1.0, 1.0), w, h)
 
 
+def tile_plan(src: Image.Image, k: int, cfg: dict) -> tuple[int, int] | None:
+    """(taille d'un morceau, recouvrement) si la texture doit être générée par morceaux à sa taille
+    finale : option comfyui.tiled et taille finale nettement au-dessus de ce que le modèle produit."""
+    c = cfg.get("comfyui", {})
+    if not c.get("tiled"):
+        return None
+    size = int(c.get("tile_size", 1024))
+    overlap = int(c.get("tile_overlap", max(32, size // 8)))
+    if max(src.width, src.height) * k <= size * 1.25:
+        return None                       # une seule passe couvre déjà la taille finale
+    return size, min(overlap, size // 2)
+
+
+def prepare_tiled(img: Image.Image, an: Analysis, k: int, base: Image.Image, overlap: int) -> tuple[Image.Image, PrepInfo]:
+    """Entrée de la génération par morceaux : `base`, la texture agrandie à sa taille finale
+    (Real-ESRGAN si disponible, sinon Lanczos), avec une marge en boucle sur les axes répétables pour que
+    les morceaux du bord voient la suite du motif. finalize_ai recadre et fond cette marge (raccord)."""
+    w, h = img.size
+    arr = np.asarray(base.convert("RGBA"))[..., :3]
+    p = max(1, math.ceil(overlap / k))                # marge en pixels source
+    px, py = (p if an.tile_x else 0), (p if an.tile_y else 0)
+    if px or py:
+        arr = np.pad(arr, ((py * k, py * k), (px * k, px * k), (0, 0)), mode="wrap")
+    ph, pw = arr.shape[:2]
+    return (Image.fromarray(np.ascontiguousarray(arr), "RGB"),
+            PrepInfo(w, h, px, py, w + 2 * px, h + 2 * py, "1:1", "tiled", (0.0, 0.0, 1.0, 1.0), pw, ph))
+
+
+def tile_starts(length: int, size: int, overlap: int) -> list[int]:
+    """Débuts des morceaux le long d'un axe : recouvrement d'au moins `overlap`, dernier morceau calé
+    sur le bord."""
+    if length <= size:
+        return [0]
+    stride = max(1, size - overlap)
+    starts = list(range(0, length - size, stride))
+    return starts + [length - size]
+
+
+def tile_weights(h: int, w: int, overlap: int, edges: tuple[bool, bool, bool, bool]) -> np.ndarray:
+    """Poids de fondu d'un morceau (rampe sur le recouvrement côté voisin) ; edges = voisin en
+    haut, en bas, à gauche, à droite."""
+    def ramp(n: int, lo: bool, hi: bool) -> np.ndarray:
+        r = np.ones(n, np.float32)
+        o = min(overlap, n // 2)
+        if o > 0:
+            up = (np.arange(o, dtype=np.float32) + 0.5) / o
+            if lo:
+                r[:o] = np.minimum(r[:o], up)
+            if hi:
+                r[n - o:] = np.minimum(r[n - o:], up[::-1])
+        return r
+    top, bottom, left, right = edges
+    return (ramp(h, top, bottom)[:, None] * ramp(w, left, right)[None, :])[..., None]
+
+
 # ---------------------------------------------------------------- post-traitement
 
 def _feather_wrap(arr: np.ndarray, pad: int, size: int, axis: int) -> np.ndarray:
@@ -468,7 +523,9 @@ def finalize_ai(output: Image.Image, src: Image.Image, an: Analysis, prep: PrepI
     box = (round(x0 * ow), round(y0 * oh), max(round(x0 * ow) + 1, round(x1 * ow)), max(round(y0 * oh) + 1, round(y1 * oh)))
     crop = output.convert("RGB").crop(box)
     fw, fh = prep.padded_w * k, prep.padded_h * k
-    if prep.pad_x == 0 and prep.pad_y == 0 and (an.tile_x or an.tile_y):
+    if crop.size == (fw, fh):
+        arr = np.asarray(crop, dtype=np.float32) / 255.0      # déjà à la taille finale (par morceaux)
+    elif prep.pad_x == 0 and prep.pad_y == 0 and (an.tile_x or an.tile_y):
         # sortie déjà raccordable (padding circulaire du workflow) : redimensionner en boucle
         arr = _wrap_resize(np.asarray(crop), (fw, fh), an.tile_x, an.tile_y).astype(np.float32) / 255.0
     else:
@@ -568,24 +625,40 @@ def _esrgan(img: Image.Image, exe: str, model: str) -> Image.Image | None:
             return None
 
 
-def local_upscale(src: Image.Image, k: int, an: Analysis, cfg: dict, use_esrgan: bool = True) -> Image.Image:
-    """Agrandissement sans IA générative : Real-ESRGAN si configuré, sinon Lanczos.
-    Sert de repli et de référence pour la validation."""
+def esrgan_exe_usable(cfg: dict) -> str:
+    """Chemin de Real-ESRGAN utilisable pour l'agrandissement local, sinon chaîne vide."""
+    exe = str(cfg.get("local", {}).get("esrgan_exe", "") or "")
+    return exe if exe and "realesrgan" in Path(exe).stem.lower() and Path(exe).exists() else ""
+
+
+def local_upscale_engine(src: Image.Image, k: int, an: Analysis, cfg: dict,
+                         use_esrgan: bool = True) -> tuple[Image.Image, str]:
+    """local_upscale, avec le moteur réellement utilisé : modèle Real-ESRGAN, « lanczos »,
+    « normal » (normal map, canal par canal) ou « none » (taille d'origine gardée)."""
     W, H = src.width * k, src.height * k
     if an.normal_packing:
-        return upscale_normal_map(src, (W, H), an)
+        return upscale_normal_map(src, (W, H), an), "normal"
     base = opaque_rgba(src, an)
     rgb = None
+    engine = "lanczos" if k > 1 else "none"
     if use_esrgan and k > 1:
         lc = cfg.get("local", {})
-        up = _esrgan(base, lc.get("esrgan_exe", ""), lc.get("esrgan_model", "realesrgan-x4plus"))
+        model = lc.get("esrgan_model", "realesrgan-x4plus")
+        up = _esrgan(base, lc.get("esrgan_exe", ""), model)
         if up is not None:
             rgb = np.asarray(up.resize((W, H), LANCZOS))
+            engine = model
     if rgb is None:
         arr = np.asarray(base)[..., :3]
         rgb = _wrap_resize(arr, (W, H), an.tile_x, an.tile_y)
     alpha = (final_alpha(src, an, (W, H)) * 255 + 0.5).astype(np.uint8)
-    return Image.fromarray(np.concatenate([rgb[..., :3], alpha[..., None]], axis=-1), "RGBA")
+    return Image.fromarray(np.concatenate([rgb[..., :3], alpha[..., None]], axis=-1), "RGBA"), engine
+
+
+def local_upscale(src: Image.Image, k: int, an: Analysis, cfg: dict, use_esrgan: bool = True) -> Image.Image:
+    """Agrandissement sans IA générative : Real-ESRGAN si configuré, sinon Lanczos.
+    Sert de repli et de référence pour la validation."""
+    return local_upscale_engine(src, k, an, cfg, use_esrgan)[0]
 
 
 def save_png(img: Image.Image, path: Path) -> None:

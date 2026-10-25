@@ -121,7 +121,7 @@ def _fields(s: str) -> list[str]:
 def source_strings(root: Path) -> dict[str, str]:
     """Chaînes passées littéralement à tr() / N_() dans le code : {texte: fichier:ligne}."""
     found: dict[str, str] = {}
-    files = [root / "app_gui.py", *sorted((root / "texforge").glob("*.py"))]
+    files = [root / "app_gui.py", root / "gui_compare.py", *sorted((root / "texforge").glob("*.py"))]
     for f in files:
         if not f.is_file():
             continue

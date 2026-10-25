@@ -41,6 +41,7 @@ import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Callable, Literal
+from urllib.parse import quote
 
 import aiohttp
 from PIL import Image
@@ -443,6 +444,54 @@ class ComfyUIBackend(HttpBackend):
                    version=version, gpu=dev.get("name", "GPU ?"), free=_gb(dev.get("vram_free")),
                    total=_gb(dev.get("vram_total")), ws=ws))
 
+    async def node_classes(self) -> set[str] | None:
+        """Types de nœuds installés sur le serveur (/object_info) ; None si la liste est illisible."""
+        status, body = await self._request("GET", "/object_info")
+        if status != 200:
+            return None
+        try:
+            info = parse_json(body, "/object_info")
+        except TextureError:
+            return None
+        return set(info) if isinstance(info, dict) else None
+
+    async def probe_node_classes(self, wanted: set[str]) -> set[str] | None:
+        """Repli de node_classes, une requête par type (/object_info/<type>) : la liste complète peut
+        échouer (extension cassée, réponse énorme) alors que chaque type se lit encore. Renvoie les
+        types présents parmi `wanted` ; None si le serveur ne répond pas à ces requêtes."""
+        present: set[str] = set()
+        for cls in sorted(wanted):
+            status, body = await self._request("GET", "/object_info/" + quote(cls, safe=""))
+            if status != 200:
+                return None
+            try:
+                info = parse_json(body, "/object_info/" + cls)
+            except TextureError:
+                return None
+            if not isinstance(info, dict):
+                return None
+            if cls in info:
+                present.add(cls)
+        return present
+
+    async def input_options(self, cls: str, field: str) -> list[str] | None:
+        """Valeurs proposées par un menu d'un nœud (fichiers de modèles d'un chargeur) ; None si illisible."""
+        status, body = await self._request("GET", "/object_info/" + quote(cls, safe=""))
+        if status != 200:
+            return None
+        try:
+            info = parse_json(body, "/object_info/" + cls)
+            inputs = info[cls]["input"]
+            spec = (inputs.get("required") or {}).get(field) or (inputs.get("optional") or {})[field]
+        except (TextureError, KeyError, TypeError, AttributeError):
+            return None
+        first = spec[0] if spec else None
+        if isinstance(first, list):
+            return [str(x) for x in first]
+        if first == "COMBO" and len(spec) > 1 and isinstance(spec[1], dict):
+            return [str(x) for x in spec[1].get("options", [])]
+        return None
+
     async def vram_free_bytes(self) -> int | None:
         status, body = await self._request("GET", "/system_stats")
         if status != 200:
@@ -683,6 +732,44 @@ class ComfyUIBackend(HttpBackend):
     def _progress(self, text: str) -> None:
         queue = tr(" · file {n}", n=self._queue_remaining) if self._queue_remaining else ""
         self._emit(text + queue)
+
+
+_MISSING_ID = re.compile(r"Node ID '#?([^']+)'")
+_MISSING_TITLE = re.compile(r"Node '(.+)' not found")
+_MISSING_OLD = re.compile(r"node (\S+) does not exist")
+
+
+def missing_node_class(exc: WorkflowError, graph: dict[str, dict[str, Any]]) -> str | None:
+    """Type du nœud que ComfyUI dit absent dans un refus de /prompt (None : refus d'une autre nature).
+    ComfyUI récent : error.type « missing_node_type », extra_info.class_type, sinon l'identifiant ou
+    le titre du nœud dans le message ; ancien : « Cannot execute because node X does not exist »."""
+    try:
+        data = json.loads(exc.details)
+    except (TypeError, ValueError):
+        data = None
+    err = data.get("error") if isinstance(data, dict) else None
+    text = str(exc)
+    if isinstance(err, dict):
+        extra = err.get("extra_info") if isinstance(err.get("extra_info"), dict) else {}
+        if extra.get("class_type"):
+            return str(extra["class_type"])
+        text = " ".join(str(err.get(k) or "") for k in ("message", "details")) + " " + text
+        if err.get("type") not in (None, "missing_node_type", "invalid_prompt"):
+            return None
+    m = _MISSING_OLD.search(text)
+    if m:
+        return m.group(1).rstrip(".")
+    if "not found" not in text:
+        return None
+    m = _MISSING_ID.search(text)
+    if m and m.group(1) in graph:
+        return str(graph[m.group(1)].get("class_type"))
+    m = _MISSING_TITLE.search(text)
+    if m:
+        for node in graph.values():
+            if str((node.get("_meta") or {}).get("title", "")) == m.group(1):
+                return str(node.get("class_type"))
+    return None
 
 
 def describe_prompt_error(status: int, data: Any, body: bytes) -> str:

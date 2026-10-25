@@ -33,6 +33,7 @@ import time
 from dataclasses import asdict, dataclass, fields
 from pathlib import Path
 
+from . import __version__
 from .config import DEFAULTS, load_config
 from .events import EventBus
 from .i18n import N_, tr
@@ -42,7 +43,13 @@ FAMILIES = {
     # famille : (workflow principal, workflow pour les matériaux à joints)
     "sdxl": ("workflows/texforge_sdxl_tile_api.json", "workflows/texforge_sdxl_tile_canny_api.json"),
     "sd15": ("workflows/texforge_sd15_tile_api.json", ""),
+    # Z-Image Turbo (UNet + Qwen3 4B + VAE séparés) avec son ControlNet Tile (« model patch ») ; sans ce
+    # fichier, TEXFORGE retire le ControlNet du workflow et passe en img2img doux
+    "zimage": ("workflows/texforge_zimage_turbo_tile_api.json", ""),
 }
+# Échelle du denoise des préréglages (réglés pour SDXL + ControlNet Tile) : avec / sans ControlNet Tile.
+# Z-Image + Tile supporte un denoise plus fort ; sans ControlNet, il redessinerait les formes.
+DENOISE_SCALE = {"zimage": (1.3, 0.75)}
 STAGES = ("scan", "generate", "export")
 STAGE_LABELS = {"scan": N_("Scan et routage"), "generate": N_("Génération (UI, local, ComfyUI)"),
                 "export": N_("Contrôle qualité et export DDS")}          # tr(STAGE_LABELS[…]) à l'affichage
@@ -60,7 +67,7 @@ class RemasterSettings:
     # moteur IA
     provider: str = "comfyui"       # comfyui | esrgan (sans ComfyUI : Real-ESRGAN réaliste) | mock (simulation)
     server: str = "http://127.0.0.1:8188"
-    model_family: str = "sdxl"      # sdxl | sd15 | custom
+    model_family: str = "sdxl"      # sdxl | sd15 | zimage | custom
     workflow: str = ""              # famille custom : workflow au format API
     workflow_edges: str = ""
     checkpoint: str = ""            # vide : celui du workflow
@@ -76,6 +83,8 @@ class RemasterSettings:
     redo_stale: bool = True         # régénérer les textures produites avec d'autres réglages
     # options et routage
     route_ui: bool = True
+    force_ai: bool = False          # tout par ComfyUI (sauf normal maps, cartes de données, polices)
+    tiled: bool = True              # ComfyUI : génération par morceaux à la taille finale
     seamless: bool = True
     force_seamless: bool = False
     mipmaps: bool = True
@@ -207,6 +216,17 @@ def material_presets(s: RemasterSettings) -> dict:
     return out
 
 
+def usable_esrgan(raw: str) -> str:
+    """Real-ESRGAN réglé s'il existe encore ; sinon celui que TEXFORGE trouve (tools\\, PATH) ; sinon vide.
+    Un chemin périmé (dossier déplacé) ne doit pas faire retomber en silence sur Lanczos."""
+    p = Path(raw) if raw else None
+    if p is not None and p.is_file() and "realesrgan" in p.stem.lower():
+        return str(p)
+    from .esrgan import find_realesrgan
+    found = find_realesrgan()
+    return str(found) if found else ""
+
+
 def write_project_config(s: RemasterSettings) -> Path:
     work = work_dir_of(s)
     work.mkdir(parents=True, exist_ok=True)
@@ -214,6 +234,7 @@ def write_project_config(s: RemasterSettings) -> Path:
         wf, wf_edges = s.workflow, s.workflow_edges
     else:
         wf, wf_edges = FAMILIES[s.model_family]
+    esrgan_exe = usable_esrgan(s.realesrgan_exe)
     bc7 = s.dds_format == "bc7"
     d3d11 = bc7 or s.target == "loose"          # Fallout 4 et Starfield : Direct3D 11, BC7 lisible
     sections = {
@@ -223,10 +244,13 @@ def write_project_config(s: RemasterSettings) -> Path:
                    "mipmaps": "always" if s.mipmaps else "match"},
         "provider": {"name": s.provider},
         "comfyui": {"server": s.server, "workflow": wf, "workflow_edges": wf_edges, "checkpoint": s.checkpoint,
-                    "lora": s.lora, "lora_strength": float(s.lora_strength)},
-        "routing": {"enabled": bool(s.route_ui)},
-        "ui_upscale": {"realesrgan_exe": s.realesrgan_exe},
-        "local": {"esrgan_exe": s.realesrgan_exe},
+                    "lora": s.lora, "lora_strength": float(s.lora_strength), "tiled": bool(s.tiled),
+                    "denoise_scale": DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[0],
+                    "denoise_scale_no_cn": DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[1],
+                    "tile_size": 512 if s.model_family == "sd15" else 1024},
+        "routing": {"enabled": bool(s.route_ui), "force_ai": bool(s.force_ai)},
+        "ui_upscale": {"realesrgan_exe": esrgan_exe},
+        "local": {"esrgan_exe": esrgan_exe},
         "esrgan": {"detail": float(s.esrgan_detail)},
         "qc": {"enabled": bool(s.qc), "auto_fix": bool(s.qc_autofix), "encoder": s.encoder,
                "texconv_exe": s.texconv_exe, "target_api": "d3d11" if d3d11 else "d3d9", "allow_bc7": d3d11},
@@ -354,7 +378,15 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
         family, checkpoint = "realesrgan-x4plus + realesr-animevideov3", "—"
     bus.emit("pipeline_start", input=str(Path(s.input_dir).resolve()), output=str(Path(s.output_dir).resolve()),
              work=str(work_dir_of(s)), provider=s.provider, model=family, checkpoint=checkpoint,
-             lora=s.lora or "", config=str(Path(cfg["_base"]) / "texforge.toml"))
+             lora=s.lora or "", config=str(Path(cfg["_base"]) / "texforge.toml"),
+             version=__version__, program=str(Path(__file__).resolve().parent.parent))
+
+    if s.provider == "comfyui" and s.tiled and not cfg["local"].get("esrgan_exe"):
+        bus.emit("info", message=tr("[INFO] ⚠ Real-ESRGAN introuvable : les morceaux partiront d'un agrandissement "
+                                    "Lanczos flou et l'IA ajoutera peu de détail. Bouton « Installer Real-ESRGAN »."))
+    elif s.realesrgan_exe and cfg["local"].get("esrgan_exe") != s.realesrgan_exe:
+        bus.emit("info", message=tr("[INFO] Real-ESRGAN réglé introuvable ({old}) : {new} utilisé.",
+                                    old=s.realesrgan_exe, new=cfg["local"]["esrgan_exe"]))
 
     # 1. scan et routage
     bus.set_stage("scan")
@@ -396,6 +428,12 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     bus.emit("info", message=tr("[INFO] {seen} texture(s) analysée(s) — {new} nouvelle(s), {changed} modifiée(s), "
                                 "{errors} illisible(s) — routage : {routes}", seen=counts.get("seen", 0),
                                 new=counts["new"], changed=counts["changed"], errors=counts["errors"], routes=routes))
+    if counts.get("skin_local"):
+        bus.emit("info", message=tr("[INFO] {n} texture(s) de peau ou de visage : agrandie(s) sans IA générative "
+                                    "(l'IA redessinerait les traits)", n=counts["skin_local"]))
+    if counts.get("missing"):
+        bus.emit("info", message=tr("[INFO] {n} texture(s) d'un scan précédent introuvable(s) (fichier supprimé ou "
+                                    "renommé) : mise(s) de côté", n=counts["missing"]))
     if counts.get("seen", 0) == 0:
         # rien à traiter : ne pas annoncer un succès ni écrire un rapport vide dans le dossier de sortie
         from .detect import check_input, empty_input_help

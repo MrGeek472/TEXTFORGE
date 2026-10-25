@@ -95,7 +95,9 @@ def _fmt(rec: dict[str, Any]) -> str | None:
                 + tr("[INFO] sortie {output} — moteur {provider}, modèle {model}, checkpoint {checkpoint}",
                      output=rec.get("output", ""), provider=rec.get("provider", ""), model=rec.get("model", ""),
                      checkpoint=rec.get("checkpoint", ""))
-                + lora + "\n" + tr("[INFO] projet : {work}", work=rec.get("work", "")))
+                + lora + "\n" + tr("[INFO] projet : {work}", work=rec.get("work", ""))
+                + ("\n" + tr("[INFO] TEXFORGE {version} lancé depuis {program}", version=rec["version"],
+                              program=rec.get("program", "?")) if rec.get("version") else ""))
     if e == "pipeline_stage":
         label = rec.get("label", rec.get("stage", ""))
         return tr("══ ÉTAPE {index}/{total} : {label}", index=rec.get("index", "?"), total=rec.get("total", "?"),

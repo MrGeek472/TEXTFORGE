@@ -472,7 +472,51 @@ PACKED_EXTS = {".assets": "Unity", ".ress": "Unity", ".resource": "Unity", ".uni
                ".utoc": "Unreal Engine", ".ucas": "Unreal Engine", ".upk": "Unreal Engine 3",
                ".vpk": "Source", ".gcf": "Source", ".bsa": "Bethesda", ".ba2": "Bethesda", ".rpf": "RAGE",
                ".forge": "Anvil", ".pk3": "id Tech", ".pk4": "id Tech", ".pak": "", ".big": "", ".arc": "",
-               ".pck": "", ".wad": "", ".cpk": "", ".gpk": ""}
+               ".pck": "", ".wad": "", ".cpk": "", ".gpk": "", ".000": ""}     # .000 : bigfile.000, .001…
+
+
+NUMBERED_ARCHIVE = re.compile(r"^\.\d{3}$")       # bigfile.000, data.001… (archives en plusieurs parties)
+FEW_IMAGES = 32         # moins que ça dans un dossier de jeu : icônes, lanceur, captures — pas les textures du jeu
+
+
+def graphics_api(folder: str | Path) -> str:
+    """API graphique du jeu d'après les DLL que citent ses exécutables (« d3d9 », « d3d11 », « d3d12 »,
+    « opengl »… ; "" si inconnue). Un exécutable protégé ou compressé ne dit rien."""
+    exes: list[tuple[int, Path]] = []
+    stack = [(Path(folder), 0)]
+    while stack:
+        d, lvl = stack.pop()
+        try:
+            for e in os.scandir(d):
+                if e.is_dir(follow_symlinks=False) and lvl < 3 and e.name.lower() not in SKIP_DIRS:
+                    stack.append((Path(e.path), lvl + 1))
+                elif e.name.lower().endswith(".exe") and not e.name.lower().startswith(("unins", "setup", "vc_redist",
+                                                                                      "dxsetup", "crashreport")):
+                    exes.append((e.stat().st_size, Path(e.path)))
+        except OSError:
+            continue
+    marks = {b"d3d8.dll": "d3d8", b"d3d9.dll": "d3d9", b"d3d10.dll": "d3d10", b"d3d11.dll": "d3d11",
+             b"d3d12.dll": "d3d12", b"opengl32.dll": "opengl", b"vulkan-1.dll": "vulkan"}
+    found: set[str] = set()
+    for _size, exe in sorted(exes, reverse=True)[:3]:
+        try:
+            with open(exe, "rb") as f:
+                tail = b""
+                for _ in range(64):                        # 64 Mo au plus par exécutable
+                    chunk = f.read(1 << 20)
+                    if not chunk:
+                        break
+                    low = (tail + chunk).lower()
+                    found |= {api for m, api in marks.items() if m in low}
+                    tail = chunk[-16:]
+        except OSError:
+            continue
+    if {"d3d11", "d3d12"} <= found:
+        return "d3d11/d3d12"
+    for api in ("d3d12", "d3d11", "d3d10", "d3d9", "d3d8", "vulkan", "opengl"):
+        if api in found:
+            return api
+    return ""
 
 
 @dataclass
@@ -512,8 +556,9 @@ def check_input(path: str | Path, max_entries: int = 60_000, stop_at_image: bool
                         images += max(1, n_ba2)
                         if stop_at_image:
                             return InputCheck(images, packed, _engine(packed, unity), exe, False)
-                    elif ext in PACKED_EXTS:
-                        packed[ext] = packed.get(ext, 0) + 1
+                    elif ext in PACKED_EXTS or NUMBERED_ARCHIVE.match(ext):
+                        key = ext if ext in PACKED_EXTS else ".000"
+                        packed[key] = packed.get(key, 0) + 1
                     elif ext == ".exe":
                         exe = True
         except OSError:
@@ -540,11 +585,11 @@ def empty_input_help(path: str | Path, chk: InputCheck) -> str:
     ui = unreal_info(path)
     if ui is not None:
         return unreal_help(ui)[1]
-    lines = [tr("Aucune texture lisible dans « {path} » : TEXFORGE lit des fichiers .dds, .png, .tga, .bmp ou .jpg "
-                "séparés.", path=path)]
+    lines = [] if chk.images else [tr("Aucune texture lisible dans « {path} » : TEXFORGE lit des fichiers .dds, "
+                                      ".png, .tga, .bmp ou .jpg séparés.", path=path)]
     if chk.packed:
         top = sorted(chk.packed.items(), key=lambda kv: -kv[1])[:3]
-        archives = ", ".join(f"{n} {'.resS' if ext == '.ress' else ext}" for ext, n in top)
+        archives = ", ".join(f"{n} {({'.ress': '.resS', '.000': '.000/.001…'}).get(ext, ext)}" for ext, n in top)
         if chk.engine:
             lines.append(tr("Ce jeu ({engine}) range ses textures dans des archives ({archives}).",
                             engine=chk.engine, archives=archives))
@@ -555,6 +600,14 @@ def empty_input_help(path: str | Path, chk: InputCheck) -> str:
     lines.append(tr("Il faut d'abord les extraire pendant que le jeu tourne : lance-le avec Special K "
                     "(Ctrl+Maj+Retour arrière), active le dump des textures, joue quelques minutes, puis choisis "
                     "le dossier SK_Res\\dump\\textures (bouton « 🔍 Détecter »)."))
+    api = graphics_api(path) if chk.exe else ""
+    if api in ("d3d8", "d3d9"):
+        lines.append(tr("Ce jeu est en Direct3D {v} : Special K y gère mal les textures. Fais-le d'abord passer en "
+                        "Direct3D 11 avec dgVoodoo2 (section 2 du README), puis fais le dump.", v=api[3:]))
+    elif api in ("d3d12", "vulkan", "opengl"):
+        lines.append(tr("Ce jeu semble utiliser {api} : Special K n'y remplace pas les textures (Direct3D 11 "
+                        "seulement, Direct3D 9 en partie).", api={"d3d12": "Direct3D 12", "vulkan": "Vulkan",
+                                                                    "opengl": "OpenGL"}[api]))
     return "\n".join(lines)
 
 
@@ -648,8 +701,9 @@ def _texture_tree(root: Path, max_entries: int, time_budget: float) -> tuple[dic
                     ext = os.path.splitext(e.name)[1].lower()
                     if ext in IMAGE_EXTS:
                         n += 1
-                    elif ext in PACKED_EXTS:
-                        packed[ext] = packed.get(ext, 0) + 1
+                    elif ext in PACKED_EXTS or NUMBERED_ARCHIVE.match(ext):
+                        key = ext if ext in PACKED_EXTS else ".000"
+                        packed[key] = packed.get(key, 0) + 1
                     elif ext == ".exe":
                         exe = True
         except OSError:
@@ -729,7 +783,8 @@ def locate_textures(path: str | Path, *, profiles=None, max_entries: int = 150_0
                        N_("archives BA2"))
     # 6. textures du jeu en fichiers séparés : le sous-dossier qui les regroupe
     _direct, total, chk = _texture_tree(p, max_entries, time_budget)
-    if total.get(p, 0) > 0:
+    few = chk.exe and chk.complete and 0 < total.get(p, 0) < FEW_IMAGES
+    if total.get(p, 0) > 0 and not few:
         cur = p
         while chk.complete:              # parcours incomplet (disque entier…) : on ne devine pas
             kids = [k for k in total if k.parent == cur and total[k] > 0]
@@ -749,6 +804,17 @@ def locate_textures(path: str | Path, *, profiles=None, max_entries: int = 150_0
                    tr("aucune texture lisible : le jeu les range dans des archives — dump Special K nécessaire"))
     else:
         summary = tr("aucune texture lisible dans ce dossier")
+    if few:
+        examples = []
+        for f in p.rglob("*"):
+            if f.suffix.lower() in IMAGE_EXTS and f.is_file():
+                examples.append(f.name)
+                if len(examples) >= 3:
+                    break
+        note = tr("Ce dossier de jeu ne contient que {n} image(s) séparée(s) ({examples}) : des icônes ou des "
+                  "fichiers annexes, pas les textures du jeu.", n=total[p], examples=", ".join(examples)) + "\n" + note
+        summary = tr("{n} image(s) annexe(s) seulement : les textures du jeu sont ailleurs — dump Special K nécessaire",
+                     n=total[p])
     from .unreal import unreal_help, unreal_info
     ui = unreal_info(p)
     if ui is not None:
@@ -762,4 +828,4 @@ def locate_textures(path: str | Path, *, profiles=None, max_entries: int = 150_0
 
 __all__ = ["Candidate", "detect", "resolve_input", "inject_for", "texture_stats", "find_markers",
            "parse_libraryfolders", "game_dir_of", "has_images", "InputCheck", "check_input", "empty_input_help",
-           "Located", "locate_textures"]
+           "Located", "locate_textures", "graphics_api", "FEW_IMAGES"]

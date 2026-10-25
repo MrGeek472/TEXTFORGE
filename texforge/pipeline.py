@@ -16,8 +16,9 @@ from PIL import Image
 
 from .i18n import tr
 from .config import DEFAULT_PROMPT, result_fingerprint
-from .imaging import (IMAGE_EXTS, Analysis, analyze, finalize_ai, load_texture, local_upscale,
-                      output_scale, prepare_for_model, prepare_native, save_png)
+from .imaging import (IMAGE_EXTS, Analysis, analyze, esrgan_exe_usable, finalize_ai, load_texture,
+                      local_upscale_engine, output_scale, prepare_for_model, prepare_native, prepare_tiled,
+                      save_png, tile_plan)
 from .routing import decide
 from .providers import FatalError, ProviderError, TransientError, make_provider
 from .state import State
@@ -94,12 +95,28 @@ def analysis_of(rec: dict) -> Analysis:
 
 # ------------------------------------------------------------------ scan
 
+def local_to_redo(state, cfg: dict) -> list[dict]:
+    """Textures agrandies par Lanczos faute de Real-ESRGAN, à refaire maintenant qu'il est utilisable.
+    Une seule fois par chemin de Real-ESRGAN : un échec de Real-ESRGAN lui-même ne relance pas en boucle."""
+    exe = esrgan_exe_usable(cfg)
+    if not exe:
+        return []
+    out = []
+    for r in state.all("status='done'"):
+        m = r.get("metrics") or {}
+        if (r["mode"] == "upscale" and r.get("choice") == "local" and not r.get("reviewed")
+                and m.get("method") in ("local", "local:lanczos") and m.get("esrgan", "") != exe):
+            out.append(r)
+    return out
+
+
 def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], None] | None = None) -> dict:
     """Analyse et routage. `on_progress(i, total, nom)` est appelé avant chaque fichier ; il peut
     lever une exception pour interrompre (chaque texture est enregistrée dès qu'elle est analysée)."""
     state = open_state(cfg)
     work = Path(cfg["_work"]).resolve()
-    counts = {"new": 0, "changed": 0, "same": 0, "errors": 0}
+    counts = {"new": 0, "changed": 0, "same": 0, "errors": 0, "missing": 0}
+    found_ids: set[str] = set()
     seen = 0
     roots = []
     for root_s in cfg["_inputs"]:
@@ -132,7 +149,7 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
                 an = analyze(src.image, cfg)
                 an_d = an.to_dict()
                 auto_mode = an.mode
-                if cfg.get("routing", {}).get("enabled", True):
+                if cfg.get("routing", {}).get("enabled", True) or cfg.get("routing", {}).get("force_ai"):
                     d = decide(src.image, an, path.stem, cfg)
                     auto_mode = d.mode
                     an_d.update(route=d.route, category=d.category, ui_kind=d.ui_kind, material=d.material,
@@ -161,6 +178,8 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
                     an_d["route_reason"] = tr("règle « {rule} »", rule=extra['rule'])
                 an_d["route"] = {"ai": "comfyui", "ui": "ui", "upscale": "local", "keep": "keep"}[mode]
             counts["route_" + an_d.get("route", "keep")] = counts.get("route_" + an_d.get("route", "keep"), 0) + 1
+            if an_d.get("route") == "local" and an_d.get("material") == "skin":
+                counts["skin_local"] = counts.get("skin_local", 0) + 1
             rec.update(analysis=an_d, mode=mode, hint=hint)
             kind = state.upsert_scan(rec)
             counts[kind] += 1
@@ -172,8 +191,15 @@ def scan(cfg: dict, log: Log = print, on_progress: Callable[[int, int, str], Non
             elif old and old["mode"] != mode and cur["status"] != "pending":
                 state.update(tid, status="pending", attempts=0, result_path=None, ai_path=None,
                              best_score=None, metrics=None, choice="auto", reviewed=0)
-            elif cur["status"] == "kept":
+            elif cur["status"] in ("kept", "missing"):
                 state.update(tid, status="pending")
+            found_ids.add(tid)
+    # fichier supprimé ou renommé depuis un scan précédent : mis de côté, jamais envoyé à la génération
+    labels = {root_label(r) for r, _f in roots}
+    for r in state.all("status != 'missing'"):
+        if r["id"].partition("/")[0] in labels and r["id"] not in found_ids:
+            state.update(r["id"], status="missing", error=tr("fichier source disparu : {path}", path=r["src_path"]))
+            counts["missing"] += 1
     counts["seen"] = seen
     state.close()
     return counts
@@ -255,12 +281,12 @@ class Runner:
     def do_local(self, rec: dict) -> str:
         src, an, k = self._load(rec)
         p = self._paths(rec["id"])
-        out = local_upscale(src, k, an, self.cfg)
+        out, engine = local_upscale_engine(src, k, an, self.cfg)
         save_png(out, p["local"])
         save_png(out, p["result"])
         self.state.update(rec["id"], status="done", choice="local", result_path=str(p["result"]),
-                          local_path=str(p["local"]), metrics={"k": k, "method": "local"},
-                          fingerprint=self.fp, error=None)
+                          local_path=str(p["local"]), fingerprint=self.fp, error=None,
+                          metrics={"k": k, "method": f"local:{engine}", "esrgan": esrgan_exe_usable(self.cfg)})
         return "local"
 
     # ------------------------------------------------ génération IA
@@ -268,14 +294,21 @@ class Runner:
         tid = rec["id"]
         src, an, k = self._load(rec)
         p = self._paths(tid)
-        local = local_upscale(src, k, an, self.cfg)
+        local, _engine = local_upscale_engine(src, k, an, self.cfg)
         save_png(local, p["local"])
-        if getattr(self.provider, "native_tiling", False):
+        plan = tile_plan(src, k, self.cfg) if getattr(self.provider, "supports_tiles", False) else None
+        if plan:
+            # génération par morceaux à la taille finale, sur la version agrandie localement
+            model_in, prep = prepare_tiled(src, an, k, local, plan[1])
+        elif getattr(self.provider, "native_tiling", False):
             model_in, prep = prepare_native(src, an)
         else:
             model_in, prep = prepare_for_model(src, an, self.cfg, self.provider.ratios)
-        save_png(model_in, p["prep"])
+        if not plan:                     # par morceaux : l'entrée est la version locale, déjà enregistrée
+            save_png(model_in, p["prep"])
         context = self.provider.build_context(rec, an) if hasattr(self.provider, "build_context") else None
+        if plan and context is not None:
+            context["tiles"] = {"size": plan[0], "overlap": plan[1]}
         extra_kw = {"context": context} if context is not None else {}
         prompt = (context or {}).get("prompt") or build_prompt(self.cfg, rec.get("hint") or "", len(self.refs))
         negative = (context or {}).get("negative") or self.cfg["prompt"].get("negative", "")
@@ -394,6 +427,7 @@ class Runner:
         if redo_stale:
             rows += [r for r in self.state.all("status IN ('done','fallback')")
                      if r["mode"] == "ai" and r.get("fingerprint") != self.fp and r.get("choice") == "auto"]
+            rows += local_to_redo(self.state, self.cfg)
         if only:
             pat = only.lower()
             rows = [r for r in rows if fnmatch.fnmatch(r["name"].lower(), pat) or fnmatch.fnmatch(r["id"].lower(), pat)]

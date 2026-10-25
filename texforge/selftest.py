@@ -349,6 +349,209 @@ def _selftest_unreal(tmp: Path, failures: list) -> None:
            failures)
 
 
+def _selftest_tiles(cfg: dict, failures: list) -> None:
+    """« Tout par l'IA » (routage), génération par morceaux (découpe, fondu, raccord) et données du
+    panneau avant / après."""
+    import copy
+    from types import SimpleNamespace
+
+    from .compare import describe
+    from .imaging import (Analysis, analyze, finalize_ai, local_upscale_engine, prepare_tiled, tile_plan,
+                          tile_starts, tile_weights)
+    from .providers import ComfyUIProvider
+    from .routing import decide
+
+    c = copy.deepcopy(cfg)
+    flat = Image.new("RGBA", (128, 128), (120, 110, 100, 255))
+    an = analyze(flat, c)
+    normal = np.zeros((128, 128, 4), np.uint8)
+    normal[..., 0], normal[..., 1], normal[..., 2], normal[..., 3] = 128, 128, 255, 255
+    nimg = Image.fromarray(normal, "RGBA")
+    nan = analyze(nimg, c)
+    before = (decide(flat, an, "wall", c).route, decide(nimg, nan, "wall_n", c).route)
+    c["routing"]["force_ai"] = True
+    after = (decide(flat, an, "wall", c).route, decide(nimg, nan, "wall_n", c).route)
+    _check(before == ("local", "local") and after == ("comfyui", "local"),
+           f"tout par l'IA : aplat envoyé à ComfyUI, normal map gardée hors IA ({before} -> {after})", failures)
+
+    starts = tile_starts(1280, 512, 128)
+    cover = np.zeros(1280)
+    for s in starts:
+        cover[s:s + 512] += 1
+    _check(starts[0] == 0 and starts[-1] == 768 and cover.min() >= 1 and
+           all(b - a <= 512 - 128 for a, b in zip(starts, starts[1:], strict=False)),
+           f"découpe : tout couvert, recouvrement d'au moins 128 px ({starts})", failures)
+
+    # texture répétable : morceaux générés avec un décalage de teinte différent chacun -> fondu sans marche
+    rng = np.random.default_rng(5)
+    yy, xx = np.mgrid[0:64, 0:64] / 64.0
+    tex = np.zeros((64, 64, 3))
+    for _ in range(6):                             # motif périodique : se raccorde exactement
+        kx, ky, ph = rng.integers(1, 4), rng.integers(1, 4), rng.uniform(0, 6.3)
+        tex += np.sin(2 * np.pi * (kx * xx + ky * yy) + ph)[..., None] * rng.uniform(5, 15, 3)
+    tex = np.clip(tex + 128, 0, 255).astype(np.uint8)
+    src = Image.fromarray(np.concatenate([tex, np.full((64, 64, 1), 255, np.uint8)], axis=-1), "RGBA")
+    an_t = Analysis(64, 64, "none", True, True, 0.1, 0.1, False, "ai", "", "")
+    c2 = copy.deepcopy(cfg)
+    c2["comfyui"].update(tiled=True, tile_size=128, tile_overlap=32)
+    plan = tile_plan(src, 8, c2)
+    base, _e = local_upscale_engine(src, 8, an_t, c2)
+    model_in, prep = prepare_tiled(src, an_t, 8, base, plan[1] if plan else 32)
+    calls = []
+
+    def fake_one(piece, ctx, prompt, negative, seed, tiled=False):
+        calls.append(ctx["tiling"])
+        a = np.asarray(piece, np.float32) + (len(calls) % 3) * 6.0      # chaque morceau un peu différent
+        return Image.fromarray(np.clip(a, 0, 255).astype(np.uint8), "RGB")
+    stub = SimpleNamespace(backend=SimpleNamespace(on_progress=None), _generate_one=fake_one)
+    out = ComfyUIProvider._generate_tiled(stub, model_in, {"stem": "t", "tiling": "enable"}, "", "", 1,
+                                          plan[0] if plan else 128, plan[1] if plan else 32)
+    final, _x = finalize_ai(out, src, an_t, prep, 8, c2)
+    f = np.asarray(final, np.float32)[..., :3]
+    step = np.abs(np.diff(f, axis=1)).mean(axis=2)
+    ref_step = np.abs(np.diff(np.asarray(base, np.float32)[..., :3], axis=1)).mean(axis=2)
+    wrap_jump = float(np.abs(f[:, 0] - f[:, -1]).mean())
+    _check(plan is not None and final.size == (512, 512) and set(calls) == {"disable"}
+           and step.max() <= ref_step.max() + 8 and wrap_jump <= ref_step.mean() * 4 + 3,
+           f"par morceaux : {len(calls)} morceaux sans raccord circulaire, fondus sans marche "
+           f"(saut max {step.max():.1f} vs {ref_step.max():.1f}), bords qui se raccordent ({wrap_jump:.1f})", failures)
+    _check(tile_plan(Image.new("RGB", (256, 256)), 4, c2) is not None and tile_plan(Image.new("RGB", (32, 32)), 4, c2)
+           is None and tile_plan(src, 8, cfg) is None,
+           "par morceaux seulement si la taille finale dépasse un morceau et si l'option est active", failures)
+    w = tile_weights(128, 128, 32, (True, False, False, True))
+    _check(w[0, 64, 0] < 0.05 and w[127, 64, 0] == 1.0 and w[64, 127, 0] < 0.05 and w[64, 0, 0] == 1.0,
+           "fondu seulement du côté des morceaux voisins", failures)
+
+    # modèles : équivalent présent d'un modèle par défaut absent, famille Z-Image Turbo
+    from . import comfyui_headless_client as chc
+    from .providers import substitute_model
+    from .providers import drop_model_patches
+    from .remaster import DENOISE_SCALE, FAMILIES
+    picks = [substitute_model("ckpt_name", "juggernautXL_ragnarok.safetensors",
+                              ["old_sd15.safetensors", "sdxl_refiner_1.0.safetensors", "dreamshaperXL.safetensors"], "sdxl"),
+             substitute_model("ckpt_name", "juggernautXL_ragnarok.safetensors", [], "sdxl"),
+             substitute_model("unet_name", "z_image_turbo_bf16.safetensors", ["z_image_turbo_fp8_e4m3fn.safetensors"],
+                              "zimage"),
+             substitute_model("control_net_name", "xinsir-controlnet-tile-sdxl-1.0.safetensors",
+                              ["control_v11f1e_sd15_tile.pth"], "sdxl")]
+    _check(picks == ["dreamshaperXL.safetensors", None, "z_image_turbo_fp8_e4m3fn.safetensors", None],
+           f"modèle par défaut absent : équivalent de la même famille seulement ({picks})", failures)
+    zwf = chc.ComfyWorkflow.from_file(Path(__file__).resolve().parent.parent / FAMILIES["zimage"][0])
+    zcls = {n["class_type"] for n in zwf.graph.values()}
+    plain = drop_model_patches(zwf.graph)
+    ks = next(n for n in plain.values() if n["class_type"] == "KSampler")
+    _check({"UNETLoader", "CLIPLoader", "VAELoader", "ModelSamplingAuraFlow", "ModelPatchLoader",
+            "ZImageFunControlnet"} <= zcls and "SeamlessTile" not in zcls and zwf.output_node_ids
+           and not {"ModelPatchLoader", "ZImageFunControlnet"} & {n["class_type"] for n in plain.values()}
+           and ks["inputs"]["model"][0] in plain and DENOISE_SCALE["zimage"][0] > 1 > DENOISE_SCALE["zimage"][1],
+           "famille Z-Image Turbo : ControlNet Tile branché, retiré proprement si son fichier manque, denoise "
+           "plus fort avec lui, plus doux sans lui", failures)
+
+    tmpf = Path(tempfile.mkdtemp(prefix="texforge_cmp_"))
+    try:
+        for n in ("ai", "res"):
+            Image.new("RGB", (8, 8)).save(tmpf / f"{n}.png")
+        rec = {"id": "x/a", "name": "a", "src_path": "a.dds", "status": "done", "choice": "auto", "width": 2,
+               "height": 2, "updated": 1.0, "analysis": {"material": "metal"}, "metrics": {"method": "ai", "attempt": 1},
+               "ai_path": str(tmpf / "ai.png"), "result_path": str(tmpf / "res.png")}
+        kinds = [describe(rec).right_kind,
+                 describe({**rec, "status": "fallback", "error": "QC"}).right_kind,
+                 describe({**rec, "ai_path": None, "metrics": {"method": "local:realesrgan-x4plus"}}).right_kind,
+                 describe({**rec, "ai_path": None, "result_path": None})]
+        _check(kinds == ["ai", "ai_rejected", "local", None],
+               f"panneau avant / après : image de droite et légende selon le traitement ({kinds})", failures)
+    finally:
+        shutil.rmtree(tmpf, ignore_errors=True)
+
+
+def _selftest_robustness(tmp: Path, failures: list) -> None:
+    """Dossier de jeu avec quelques images annexes, fichier source disparu, ComfyUI sans nœuds perso."""
+    import os
+
+    from . import comfyui_headless_client as chc
+    from .detect import locate_textures
+    from .providers import fit_workflow
+
+    game = tmp / "Robustesse" / "Vieux Jeu D3D9"
+    game.mkdir(parents=True)
+    (game / "game.exe").write_bytes(b"MZ" + os.urandom(4096) + b"KERNEL32.dll\0d3d9.dll\0" + os.urandom(512))
+    for i in range(4):
+        (game / f"bigfile.{i:03d}").write_bytes(os.urandom(256))
+    Image.new("RGBA", (256, 256), (90, 60, 40, 255)).save(game / "Icone.png")
+    r = locate_textures(game, profiles=[])
+    _check(r.kind == "none" and "Icone.png" in r.note and "Direct3D 9" in r.note and ".000" in r.note,
+           f"dossier de jeu avec une seule icône : pas pris pour les textures ({r.summary})", failures)
+
+    inp = tmp / "Robustesse" / "dump"
+    inp.mkdir()
+    for nm in ("a", "b"):
+        Image.fromarray((np.random.default_rng(len(nm)).random((64, 64, 3)) * 255).astype(np.uint8)).save(inp / f"{nm}.png")
+    base = tmp / "Robustesse" / "projet"
+    base.mkdir()
+    (base / "texforge.toml").write_text(EXAMPLE_TOML.replace("inputs = ['./entree']", f"inputs = ['{inp.as_posix()}']")
+                                        .replace('name = "comfyui"', 'name = "mock"'), encoding="utf-8")
+    cfg = load_config(base / "texforge.toml")
+    scan(cfg, log=lambda *_: None)
+    (inp / "b.png").unlink()
+    c = scan(cfg, log=lambda *_: None)
+    st = open_state(cfg)
+    status = {r["name"]: r["status"] for r in st.all()}
+    st.close()
+    _check(c.get("missing") == 1 and status.get("b") == "missing" and status.get("a") != "missing",
+           f"fichier source disparu : mis de côté au lieu d'être envoyé à la génération ({status})", failures)
+
+    # agrandissement local fait par Lanczos faute de Real-ESRGAN : refait une fois quand Real-ESRGAN est réglé
+    from .pipeline import Runner, local_to_redo
+    cfg["local"]["esrgan_exe"] = ""
+    run = Runner(cfg, "mock", lambda *_: None)
+    rec_a = next(r for r in run.state.all() if r["name"] == "a")
+    run.state.update(rec_a["id"], mode="upscale")
+    run.do_local(run.state.get(rec_a["id"]))
+    m1 = (run.state.get(rec_a["id"]) or {}).get("metrics") or {}
+    fake = tmp / "Robustesse" / "outils" / ("realesrgan-ncnn-vulkan" + (".exe" if os.name == "nt" else ""))
+    fake.parent.mkdir()
+    fake.write_bytes(b"")                          # présent mais inutilisable : Real-ESRGAN échouera
+    cfg["local"]["esrgan_exe"] = str(fake)
+    redo1 = [r["name"] for r in local_to_redo(run.state, cfg)]
+    run.do_local(run.state.get(rec_a["id"]))
+    m2 = (run.state.get(rec_a["id"]) or {}).get("metrics") or {}
+    redo2 = [r["name"] for r in local_to_redo(run.state, cfg)]
+    run.state.close()
+    cfg["local"]["esrgan_exe"] = ""
+    _check(m1.get("method") == "local:lanczos" and redo1 == ["a"] and m2.get("esrgan") == str(fake) and redo2 == [],
+           f"agrandi par Lanczos faute de Real-ESRGAN : refait une fois quand il est réglé, sans boucle "
+           f"({m1.get('method')}, {redo1}, {redo2})", failures)
+
+    wf = chc.ComfyWorkflow.from_file(Path(__file__).resolve().parent.parent / "workflows" / "texforge_sdxl_tile_api.json")
+    classes = {n["class_type"] for n in wf.graph.values()}
+    vanilla, bypassed, required = fit_workflow(wf, classes - {"SeamlessTile", "MakeCircularVAE", "OffsetImage",
+                                                              "ColorTransfer"}, chc)
+    dangling = [k for n in vanilla.graph.values() for k, v in n["inputs"].items()
+                if isinstance(v, list) and len(v) == 2 and str(v[0]) not in vanilla.graph]
+    _check(not required and set(bypassed) == {"SeamlessTile", "MakeCircularVAE", "OffsetImage", "ColorTransfer"}
+           and not dangling and vanilla.output_node_ids,
+           f"ComfyUI sans nœuds personnalisés : workflow contourné proprement ({bypassed})", failures)
+    _w, _b, required = fit_workflow(wf, classes - {"ControlNetApplyAdvanced"}, chc)
+    _check(required == ["ControlNetApplyAdvanced"], "nœud indispensable absent : signalé avant tout envoi", failures)
+
+    # liste des nœuds illisible : le refus de /prompt suffit à reconnaître le nœud absent
+    def refusal(err: dict) -> chc.WorkflowError:
+        data = {"error": err, "node_errors": {}}
+        return chc.WorkflowError("workflow refusé (400)", details=json.dumps(data))
+    recent = refusal({"type": "missing_node_type", "message": "Node 'TEXFORGE_TILING' not found. The custom node "
+                      "may not be installed.", "details": "Node ID '#3'",
+                      "extra_info": {"node_id": "3", "class_type": "SeamlessTile", "node_title": "TEXFORGE_TILING"}})
+    bare = refusal({"type": "missing_node_type", "message": "Node 'TEXFORGE_TILING_VAE' not found.", "details": "",
+                    "extra_info": {}})
+    old = refusal({"type": "invalid_prompt", "message": "Cannot execute because node ColorTransfer does not exist.",
+                   "details": "Node ID '#40'", "extra_info": {}})
+    other = refusal({"type": "prompt_outputs_failed_validation", "message": "Prompt outputs failed validation",
+                     "details": "", "extra_info": {}})
+    got = [chc.missing_node_class(e, wf.graph) for e in (recent, bare, old, other)]
+    _check(got == ["SeamlessTile", "MakeCircularVAE", "ColorTransfer", None],
+           f"refus « nœud absent » de ComfyUI reconnu (récent, sans détail, ancien, autre refus) : {got}", failures)
+
+
 def _selftest_normals(cfg: dict, failures: list) -> None:
     """Normal maps rangées autrement qu'en XYZ : jamais vues comme des couleurs, ni envoyées à une IA,
     canaux conservés à l'agrandissement et dans les mipmaps (pas de prémultiplication de l'alpha)."""
@@ -610,6 +813,12 @@ def main() -> int:
 
         print("13. Jeux Unreal (reconnaissance, sans déchiffrement)")
         _selftest_unreal(tmp, failures)
+
+        print("14. Robustesse (dossier de jeu, fichier disparu, ComfyUI sans nœuds personnalisés)")
+        _selftest_robustness(tmp, failures)
+
+        print("15. Tout par l'IA, génération par morceaux, panneau avant / après")
+        _selftest_tiles(cfg, failures)
     except Exception:
         traceback.print_exc()
         failures.append("exception")

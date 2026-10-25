@@ -86,6 +86,7 @@ DEFAULTS: dict = {
         "workflow_edges": "workflows/texforge_sdxl_tile_canny_api.json",
         "checkpoint": "", "controlnet_model": "", "lora": "", "lora_strength": 0.8,
         "max_in_flight": 2, "timeout": 600,
+        "tiled": False, "tile_size": 1024, "tile_overlap": 128,
         "batch_size": 12, "free_vram": "auto", "vram_threshold_gb": 1.5,
         "free_between_groups": True, "free_every": 100,
         "max_transient_retries": 2, "max_consecutive_failures": 8,
@@ -101,7 +102,7 @@ DEFAULTS: dict = {
     "routing": {
         "enabled": True, "ui_threshold": 0.5, "flat_strong": 0.55, "flat_weak": 0.35,
         "few_colors": 24, "some_colors": 64, "many_colors": 200, "energy_material": 0.06,
-        "font_min_glyphs": 20, "font_max_spread": 1.2, "skin_route": "local",
+        "font_min_glyphs": 20, "font_max_spread": 1.2, "skin_route": "local", "force_ai": False,
     },
     "ui_upscale": {
         "engines": ["realesrgan", "waifu2x", "lanczos"],
@@ -176,7 +177,8 @@ def result_fingerprint(cfg: dict) -> str:
         "mock": cfg.get("mock", {}),
         "comfyui": {k: cfg["comfyui"].get(k) for k in ("workflow", "workflow_edges", "prompt_prefix",
                                                      "prompt_prefix_tiled", "prompt_suffix", "negative",
-                                                     "checkpoint", "controlnet_model", "lora", "lora_strength")},
+                                                     "checkpoint", "controlnet_model", "lora", "lora_strength",
+                                                     "tiled", "tile_size", "tile_overlap")},
         "materials": cfg.get("materials", {}),
         "esrgan": cfg.get("esrgan", {}) if cfg["provider"]["name"] == "esrgan" else {},
     }
@@ -232,6 +234,9 @@ server = "http://127.0.0.1:8188"
 # Chemins relatifs : cherchés à côté de ce fichier, puis dans le dossier workflows/ de TEXFORGE
 workflow = "workflows/texforge_sdxl_tile_api.json"
 workflow_edges = "workflows/texforge_sdxl_tile_canny_api.json"   # matériaux à joints (briques, carrelage)
+tiled = false              # true : génération par morceaux à la taille finale (vrai détail en 2048 / 4096)
+tile_size = 1024           # taille d'un morceau : 1024 pour SDXL, 512 pour SD 1.5
+tile_overlap = 128         # recouvrement fondu entre morceaux
 checkpoint = ''            # vide : celui du workflow ; sinon nom exact côté ComfyUI (ex. 'juggernautXL_ragnarok.safetensors')
 controlnet_model = ''      # vide : celui du workflow
 lora = ''                  # LoRA insérée après le checkpoint (vide : aucune)
@@ -254,6 +259,7 @@ fallback_model = "realesrgan-x4plus"
 enabled = true
 ui_threshold = 0.5   # score à partir duquel une texture part en pipeline UI (plus bas = plus d'UI)
 skin_route = "local" # peau et visages : "local" (sans IA générative) ou "comfyui"
+force_ai = false     # true : tout par ComfyUI sauf normal maps, cartes de données et polices
 
 [ui_upscale]
 # Moteurs essayés dans l'ordre ; lanczos (Python) sert toujours de dernier recours

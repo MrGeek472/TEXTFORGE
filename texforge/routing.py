@@ -346,6 +346,17 @@ def decide(img: Image.Image, an: Analysis, name: str, cfg: dict) -> RouteDecisio
     # Un nom explicite (hud, font, icon…) l'emporte : les archives extraites nomment leurs fichiers
     if hints.ui >= 0.6 and not hints.material:
         score = max(score, float(rc["ui_threshold"]))
+    if rc.get("force_ai"):
+        # « tout par l'IA » : seules restent hors IA les données (ci-dessus) et les polices, dont l'IA
+        # déformerait les lettres
+        if kind == "font" and score >= float(rc["ui_threshold"]):
+            return RouteDecision("ui", "ui", ui_kind=kind, ui_score=round(score, 3),
+                                 reason=tr("police de caractères : gardée hors IA (lettres déformées sinon)"),
+                                 features=fd)
+        material, mwhy = _material(f, an, hints)
+        return RouteDecision("comfyui", "material", material=material, ui_score=round(score, 3),
+                             reason=tr("tout par l'IA : matériau {material} ({why})", material=material, why=mwhy),
+                             features=fd)
     if score >= float(rc["ui_threshold"]):
         return RouteDecision("ui", "ui", ui_kind=kind, ui_score=round(score, 3),
                              reason=tr("graphisme plat ({kind}) : ", kind=kind) + ", ".join(why), features=fd)

@@ -19,7 +19,7 @@ CREATE TABLE IF NOT EXISTS textures (
     analysis TEXT,                -- JSON
     mode TEXT,                    -- ai | upscale | copy | skip
     hint TEXT DEFAULT '',
-    status TEXT,                  -- pending | done | fallback | copied | skipped | error
+    status TEXT,                  -- pending | done | fallback | copied | skipped | error | kept | missing
     choice TEXT DEFAULT 'auto',   -- auto | local | ai (décision de revue)
     reviewed INTEGER DEFAULT 0,   -- 1 : choix fait à la main dans la galerie (le QC ne le modifie pas)
     attempts INTEGER DEFAULT 0,

@@ -30,7 +30,7 @@ from .esrgan import EsrganError, EsrganJob, RealisticUpscaler
 from .events import EventBus
 from .i18n import tr
 from .imaging import local_upscale, save_png
-from .pipeline import BudgetReached, Runner, analysis_of, style_refs
+from .pipeline import BudgetReached, Runner, analysis_of, local_to_redo, style_refs
 from .providers import FatalError, ServerDown, WorkflowFatal, make_provider
 from .ui_upscale import UiJob, UiUpscaler
 
@@ -95,6 +95,11 @@ class Orchestrator:
         if redo_stale:
             rows += [r for r in self.state.all("status IN ('done','fallback')")
                      if r["mode"] == "ai" and r.get("fingerprint") != self.runner.fp and not r.get("reviewed")]
+            redo_local = local_to_redo(self.state, self.cfg)
+            if redo_local:
+                self.ev.emit("info", message=tr("[LOCAL] {n} texture(s) agrandie(s) par Lanczos faute de Real-ESRGAN : "
+                                                "refaite(s) avec Real-ESRGAN", n=len(redo_local)))
+            rows += redo_local
         if only:
             pat = only.lower()
             rows = [r for r in rows if fnmatch.fnmatch(r["name"].lower(), pat) or fnmatch.fnmatch(r["id"].lower(), pat)]
@@ -105,6 +110,11 @@ class Orchestrator:
         ai_rows = by_mode["ai"][:limit] if limit is not None else by_mode["ai"]
         total = len(by_mode["ui"]) * ("ui" in stages) + len(by_mode["upscale"]) * ("local" in stages) + \
             len(ai_rows) * ("ai" in stages)
+        if total == 0:
+            done = len(self.state.all("status IN ('done','fallback')"))
+            if done:
+                self.ev.emit("info", message=tr("[INFO] rien de nouveau à générer : {n} texture(s) déjà traitée(s) "
+                                                "lors d'un lancement précédent, exportée(s) telles quelles", n=done))
         self.ev.emit("run_start", total=total, provider=self.provider_name, ui=len(by_mode["ui"]),
                      local=len(by_mode["upscale"]), ai=len(ai_rows))
         try:
@@ -199,8 +209,9 @@ class Orchestrator:
             try:
                 self.runner.do_local(r)
                 self.stats["local"] += 1
-                k = (self.state.get(r["id"]) or {}).get("metrics", {}).get("k")
-                self.ev.emit("local_done", texture=r["id"], name=r["name"], engine="lanczos", k=k,
+                m = (self.state.get(r["id"]) or {}).get("metrics") or {}
+                engine = str(m.get("method", "local:lanczos")).split(":", 1)[-1]
+                self.ev.emit("local_done", texture=r["id"], name=r["name"], engine=engine, k=m.get("k"),
                              index=i, total=len(rows))
             except Exception as exc:
                 self.state.update(r["id"], status="error", error=str(exc))
@@ -224,6 +235,10 @@ class Orchestrator:
                 info = getattr(self.provider, "info", "")
                 if info:
                     self.ev.emit("info", message=f"[COMFYUI] {info}")
+                for note in getattr(self.provider, "notes", []):
+                    self.ev.emit("info", message=f"[COMFYUI] ⚠ {note}")
+                if hasattr(self.provider, "on_note"):      # remarques apparues en cours de lot
+                    self.provider.on_note = lambda note: self.ev.emit("info", message=f"[COMFYUI] ⚠ {note}")
                 return True
             except ServerDown as exc:
                 policy = self.cfg["comfyui"].get("on_server_down", "wait")
@@ -281,7 +296,7 @@ class Orchestrator:
             return
         self.runner.provider = self.provider
         self.runner.refs = style_refs(self.cfg) if self.provider_name == "higgsfield" else []
-        local_gpu = getattr(self.provider, "native_tiling", False)
+        local_gpu = getattr(self.provider, "local_gpu", getattr(self.provider, "native_tiling", False))
         try:
             from tqdm import tqdm
             self._bar = tqdm(total=len(rows), desc=self.provider.name, unit="tex", disable=None, leave=False)

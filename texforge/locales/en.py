@@ -912,4 +912,162 @@ MESSAGES: dict[str, str] = {
         'Possible route: in-game capture with Special K. If the game runs Direct3D 9, first move it to Direct3D 11 with dgVoodoo2 (section 2 of the README), then enable texture dumping.',
     'Une fois le dump fait, choisis à nouveau ce dossier : TEXFORGE trouvera SK_Res\\dump\\textures dans {where}.':
         'Once the dump is done, choose this folder again: TEXFORGE will find SK_Res\\dump\\textures in {where}.',
+    'Lancer quand même ?':
+        'Launch anyway?',
+    'Ce dossier de jeu ne contient que {n} image(s) séparée(s) : sans doute des icônes ou des fichiers annexes, pas les textures du jeu.':
+        "This game folder only holds {n} separate image(s): probably icons or side files, not the game's textures.",
+    '{n} image(s) annexe(s) seulement : les textures du jeu sont ailleurs — dump Special K nécessaire':
+        "only {n} side image(s): the game's textures are elsewhere — Special K dump needed",
+    "Ce jeu est en Direct3D {v} : Special K y gère mal les textures. Fais-le d'abord passer en Direct3D 11 avec dgVoodoo2 (section 2 du README), puis fais le dump.":
+        'This game runs Direct3D {v}: Special K handles its textures poorly. First move it to Direct3D 11 with dgVoodoo2 (section 2 of the README), then dump.',
+    "Ce jeu semble utiliser {api} : Special K n'y remplace pas les textures (Direct3D 11 seulement, Direct3D 9 en partie).":
+        'This game seems to use {api}: Special K does not replace textures there (Direct3D 11 only, partly Direct3D 9).',
+    'Ce dossier de jeu ne contient que {n} image(s) séparée(s) ({examples}) : des icônes ou des fichiers annexes, pas les textures du jeu.':
+        "This game folder only holds {n} separate image(s) ({examples}): icons or side files, not the game's textures.",
+    'fichier source disparu : {path}':
+        'source file gone: {path}',
+    'nœuds absents de ComfyUI : {nodes}{packs}. Installe-les avec ComfyUI Manager (Custom Nodes Manager) ou mets ComfyUI à jour, redémarre-le, puis relance.':
+        'nodes missing from ComfyUI: {nodes}{packs}. Install them with ComfyUI Manager (Custom Nodes Manager) or update ComfyUI, restart it, then launch again.',
+    'nœuds de raccord absents ({nodes}, pack ComfyUI-seamless-tiling) : TEXFORGE prolonge lui-même les textures répétables en boucle avant la génération. Raccord natif : ComfyUI Manager → Custom Nodes Manager → « ComfyUI-seamless-tiling ».':
+        'seam nodes missing ({nodes}, ComfyUI-seamless-tiling pack): TEXFORGE wraps tileable textures itself before generation. Native seams: ComfyUI Manager → Custom Nodes Manager → "ComfyUI-seamless-tiling".',
+    'liste des nœuds installés illisible (/object_info) : workflow envoyé tel quel ; un nœud facultatif refusé par ComfyUI sera contourné à la première texture.':
+        'installed node list unreadable (/object_info): workflow sent as is; an optional node refused by ComfyUI will be bypassed on the first texture.',
+    'nœuds de raccord absents de ComfyUI : contournés, texture relancée avec le raccord préparé par TEXFORGE':
+        'seam nodes missing from ComfyUI: bypassed, texture requeued with seams prepared by TEXFORGE',
+    '{exc} — type de nœud absent : {cls}{pack}. Installe-le avec ComfyUI Manager (Custom Nodes Manager) ou mets ComfyUI à jour, redémarre-le, puis relance.':
+        '{exc} — missing node type: {cls}{pack}. Install it with ComfyUI Manager (Custom Nodes Manager) or update ComfyUI, restart it, then run again.',
+    '[INFO] TEXFORGE {version} lancé depuis {program}':
+        '[INFO] TEXFORGE {version} running from {program}',
+    '[LOCAL] {n} texture(s) agrandie(s) par Lanczos faute de Real-ESRGAN : refaite(s) avec Real-ESRGAN':
+        '[LOCAL] {n} texture(s) upscaled with Lanczos because Real-ESRGAN was missing: redone with Real-ESRGAN',
+    '[INFO] rien de nouveau à générer : {n} texture(s) déjà traitée(s) lors d\'un lancement précédent, exportée(s) telles quelles':
+        '[INFO] nothing new to generate: {n} texture(s) already processed in a previous run, exported as they are',
+    '[INFO] {n} texture(s) de peau ou de visage : agrandie(s) sans IA générative (l\'IA redessinerait les traits)':
+        '[INFO] {n} skin or face texture(s): upscaled without generative AI (the AI would redraw the features)',
+    '◧ Avant / Après':
+        '◧ Before / After',
+    'Afficher ou masquer le panneau avant / après (original à gauche, IA à droite)':
+        'Show or hide the before / after panel (original on the left, AI on the right)',
+    "Tout passer par l'IA (ComfyUI)":
+        'Send everything through AI (ComfyUI)',
+    "Peau, visages, HUD, aplats et petites textures partent aussi vers ComfyUI.\nRestent hors IA : normal maps et cartes de données (l'IA en ferait des données\nfausses) et polices (lettres déformées).":
+        'Skin, faces, HUD, flat colours and small textures also go to ComfyUI.\nKept out of AI: normal maps and data maps (the AI would turn them into wrong\ndata) and fonts (distorted letters).',
+    'IA par morceaux à la taille finale':
+        'AI in tiles at the final size',
+    'Le modèle travaille à environ 1 mégapixel. Coché : la texture est agrandie, puis\ngénérée morceau par morceau à sa taille finale (vrai détail en 2048 / 4096).\nDécoché : une seule passe à 1 mégapixel, puis agrandissement classique.':
+        'The model works at about 1 megapixel. Checked: the texture is upscaled, then\ngenerated tile by tile at its final size (real detail at 2048 / 4096).\nUnchecked: a single pass at 1 megapixel, then a plain upscale.',
+    'Peau, visages et HUD compris. Restent hors IA : normal maps, cartes de données et polices.':
+        'Skin, faces and HUD included. Kept out of AI: normal maps, data maps and fonts.',
+    'Vrai détail IA en 2048 / 4096 : 9 passages par texture en 2048, 25 en 4096 (plusieurs minutes par texture en 4096).':
+        'Real AI detail at 2048 / 4096: 9 passes per 2048 texture, 25 per 4096 (several minutes per 4096 texture).',
+    'QC : {label}':
+        'QC: {label}',
+    'détail ×{gain:.2f}':
+        'detail ×{gain:.2f}',
+    'Real-ESRGAN (mode réaliste)':
+        'Real-ESRGAN (realistic mode)',
+    'Essai IA écarté — le fichier exporté est la version locale':
+        'AI attempt discarded — the exported file is the local version',
+    'matériau {material}':
+        'material {material}',
+    'essai {n}':
+        'attempt {n}',
+    'raison : {why}':
+        'reason: {why}',
+    'IA (ComfyUI)':
+        'AI (ComfyUI)',
+    'routage : {why}':
+        'routing: {why}',
+    'Agrandissement UI ({engine}), sans IA générative':
+        'UI upscale ({engine}), no generative AI',
+    'Agrandissement sans IA ({engine})':
+        'Upscale without AI ({engine})',
+    '{stem} : morceau {i}/{n}':
+        '{stem}: tile {i}/{n}',
+    "tout par l'IA : matériau {material} ({why})":
+        'everything through AI: material {material} ({why})',
+    'police de caractères : gardée hors IA (lettres déformées sinon)':
+        'font: kept out of AI (letters would be distorted)',
+    'AVANT / APRÈS':
+        'BEFORE / AFTER',
+    'Texture précédente':
+        'Previous texture',
+    'Texture suivante':
+        'Next texture',
+    'IA seulement':
+        'AI only',
+    "Ne lister que les textures passées par l'IA":
+        'List only textures that went through AI',
+    'Suivre':
+        'Follow',
+    "Pendant un lancement, afficher chaque texture dès qu'elle est terminée":
+        'During a run, show each texture as soon as it is finished',
+    'Résultat':
+        'Result',
+    'Ajuster':
+        'Fit',
+    'Image entière (double-clic sur une image)':
+        'Whole image (double-click an image)',
+    "Un pixel du résultat = un pixel de l'écran":
+        'One result pixel = one screen pixel',
+    "Aucune texture traitée dans ce projet pour l'instant. Lance le pipeline : chaque texture apparaîtra ici dès qu'elle est terminée.":
+        'No texture processed in this project yet. Run the pipeline: each texture will appear here as soon as it is finished.',
+    'Original — {w}×{h}':
+        'Original — {w}×{h}',
+    '{label} — chargement…':
+        '{label} — loading…',
+    '{label} — {w}×{h}':
+        '{label} — {w}×{h}',
+    '{label} — image illisible':
+        '{label} — unreadable image',
+    'Original illisible : {err}':
+        'Original unreadable: {err}',
+    'Z-Image Turbo — ControlNet Tile (model patch) si présent':
+        'Z-Image Turbo — Tile ControlNet (model patch) when present',
+    "[INFO] ComfyUI n'a aucun checkpoint SDXL / SD 1.5 mais a Z-Image Turbo : famille Z-Image Turbo choisie.":
+        '[INFO] ComfyUI has no SDXL / SD 1.5 checkpoint but has Z-Image Turbo: Z-Image Turbo family selected.',
+    'denoise / ControlNet Tile effectifs : {txt} — sans le fichier du ControlNet Tile : denoise ×{f}':
+        'effective denoise / Tile ControlNet: {txt} — without the Tile ControlNet file: denoise ×{f}',
+    '[INFO] Z-Image Turbo absent de ComfyUI : famille SDXL choisie.':
+        '[INFO] Z-Image Turbo missing from ComfyUI: SDXL family selected.',
+    "n'importe quel checkpoint SDXL convient, ex. huggingface.co/RunDiffusion/Juggernaut-XL-v9 (7,1 Go)":
+        'any SDXL checkpoint will do, e.g. huggingface.co/RunDiffusion/Juggernaut-XL-v9 (7.1 GB)',
+    'huggingface.co/xinsir/controlnet-tile-sdxl-1.0 (diffusion_pytorch_model.safetensors, 2,5 Go, à renommer ainsi)':
+        'huggingface.co/xinsir/controlnet-tile-sdxl-1.0 (diffusion_pytorch_model.safetensors, 2.5 GB, rename it to this)',
+    'huggingface.co/xinsir/controlnet-union-sdxl-1.0 (diffusion_pytorch_model_promax.safetensors, 2,5 Go, à renommer ainsi)':
+        'huggingface.co/xinsir/controlnet-union-sdxl-1.0 (diffusion_pytorch_model_promax.safetensors, 2.5 GB, rename it to this)',
+    "n'importe quel checkpoint SD 1.5 convient":
+        'any SD 1.5 checkpoint will do',
+    'huggingface.co/lllyasviel/ControlNet-v1-1':
+        'huggingface.co/lllyasviel/ControlNet-v1-1',
+    'huggingface.co/Comfy-Org/z_image_turbo':
+        'huggingface.co/Comfy-Org/z_image_turbo',
+    'dossier vide':
+        'empty folder',
+    'présents : {names}':
+        'present: {names}',
+    "ton ComfyUI n'a pas de checkpoint pour ce workflow mais il a Z-Image Turbo ({name}) : choisis la famille « Z-Image Turbo » dans TEXFORGE, sans rien télécharger. ":
+        'your ComfyUI has no checkpoint for this workflow but it has Z-Image Turbo ({name}): choose the "Z-Image Turbo" family in TEXFORGE, no download needed. ',
+    'modèles absents de ComfyUI : {items}. Après un ajout, redémarre ComfyUI puis relance.':
+        'models missing from ComfyUI: {items}. After adding them, restart ComfyUI and run again.',
+    'modèle « {val} » absent de ComfyUI : « {pick} » utilisé à la place.':
+        'model "{val}" missing from ComfyUI: "{pick}" used instead.',
+    '« {val} » (models\\{folder}, {have})':
+        '"{val}" (models\\{folder}, {have})',
+    'workflow Tile+Canny désactivé : modèle « {val} » absent de ComfyUI (dossier models\\{folder}) ; toutes les matières passent par le workflow Tile.':
+        'Tile+Canny workflow disabled: model "{val}" missing from ComfyUI (models\\{folder} folder); all materials use the Tile workflow.',
+    "ControlNet Tile « {val} » absent de ComfyUI (models\\model_patches) : img2img sans ControlNet, denoise réduit. Avec lui, l'IA peut ajouter bien plus de détail sans redessiner les formes.":
+        'Tile ControlNet "{val}" missing from ComfyUI (models\\model_patches): img2img without ControlNet, reduced denoise. With it, the AI can add much more detail without redrawing shapes.',
+    "[INFO] ⚠ Real-ESRGAN introuvable : les morceaux partiront d'un agrandissement Lanczos flou et l'IA ajoutera peu de détail. Bouton « Installer Real-ESRGAN ».":
+        '[INFO] ⚠ Real-ESRGAN not found: tiles will start from a blurry Lanczos upscale and the AI will add little detail. Use "Install Real-ESRGAN".',
+    '[INFO] Real-ESRGAN réglé introuvable ({old}) : {new} utilisé.':
+        '[INFO] Configured Real-ESRGAN not found ({old}): {new} used.',
+    'nœud ColorTransfer absent : couleurs recalées par TEXFORGE après la génération.':
+        'ColorTransfer node missing: colours realigned by TEXFORGE after generation.',
+    'nœud OffsetImage absent : aperçu du raccord dans ComfyUI désactivé (sans effet sur le résultat).':
+        'OffsetImage node missing: seam preview in ComfyUI disabled (no effect on the result).',
+    'workflow Tile+Canny désactivé, nœuds absents : {nodes} ; toutes les matières passent par le workflow Tile.':
+        'Tile+Canny workflow disabled, missing nodes: {nodes}; every material goes through the Tile workflow.',
+    "[INFO] {n} texture(s) d'un scan précédent introuvable(s) (fichier supprimé ou renommé) : mise(s) de côté":
+        '[INFO] {n} texture(s) from a previous scan not found (file deleted or renamed): set aside',
 }

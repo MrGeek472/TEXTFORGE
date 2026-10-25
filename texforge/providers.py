@@ -10,6 +10,7 @@ import hashlib
 import io
 import os
 import sys
+import re
 import time
 import uuid
 from pathlib import Path
@@ -18,7 +19,7 @@ from typing import Callable
 import numpy as np
 from PIL import Image, ImageFilter
 
-from .i18n import tr
+from .i18n import N_, tr
 from .imaging import LANCZOS, parse_ratio
 
 
@@ -246,7 +247,9 @@ class ComfyUIProvider:
 
     name = "comfyui"
     paid = False
+    local_gpu = True              # file locale : groupes par workflow et par raccord, préréglages par matériau
     native_tiling = True          # le raccord est géré dans le workflow (padding circulaire)
+    supports_tiles = True         # génération par morceaux à la taille finale (comfyui.tiled)
     ratios = ["1:1"]
 
     def __init__(self, cfg: dict, state=None, on_progress: Callable[[str], None] | None = None):
@@ -258,6 +261,10 @@ class ComfyUIProvider:
         self.chc = chc
         self._asyncio = asyncio
         self._warned: set[str] = set()
+        self._fit_lock = threading.Lock()
+        self._missing: set[str] = set()       # types de nœuds absents du serveur (contournés)
+        self._edges_off = False               # workflow Tile+Canny inutilisable sur ce serveur
+        self.on_note: Callable[[str], None] | None = None
         try:
             self.wf_main = customize_workflow(chc.ComfyWorkflow.from_file(
                 resolve_workflow_path(cfg, self.c["workflow"])), self.c, chc)
@@ -266,6 +273,13 @@ class ComfyUIProvider:
                 resolve_workflow_path(cfg, edges_raw)), self.c, chc) if edges_raw else None)
         except chc.WorkflowError as exc:
             raise WorkflowFatal(tr("workflow ComfyUI invalide : {exc}", exc=exc)) from exc
+        self._orig_main, self._orig_edges = self.wf_main, self.wf_edges
+        titles = {str((n.get("_meta") or {}).get("title", "")) for n in self.wf_main.graph.values()}
+        classes = {n.get("class_type") for n in self.wf_main.graph.values()}
+        # raccord circulaire seulement si le workflow a le nœud (sans lui : bords prolongés par TEXFORGE) ;
+        # réglages sans nœud correspondant (Z-Image : ni ControlNet ni raccord) ignorés sans avertissement
+        self.native_tiling = "SeamlessTile" in classes
+        self._warned |= {t for t in ("TEXFORGE_CN_TILE", "TEXFORGE_TILING", "TEXFORGE_TILING_VAE") if t not in titles}
         self.loop = asyncio.new_event_loop()
         self.thread = threading.Thread(target=self.loop.run_forever, name="comfyui-loop", daemon=True)
         self.thread.start()
@@ -273,11 +287,198 @@ class ComfyUIProvider:
                                           max_in_flight=int(self.c.get("max_in_flight", 2)))
         self.backend.on_progress = on_progress
         self._call(self.backend.start())
+        self.notes: list[str] = []
         try:
             self.info = self.check_ready()
+            self._fit_to_server()
         except BaseException:
             self.close()          # sinon la boucle et le WebSocket de cet essai restent ouverts
             raise
+
+    def _fit_to_server(self) -> None:
+        """Workflow adapté aux nœuds installés sur ce serveur : les nœuds facultatifs absents sont
+        contournés (TEXFORGE fait le travail lui-même), un nœud indispensable absent arrête tout de
+        suite, avec la liste, au lieu d'un refus texture par texture."""
+        self._fit_models()
+        wanted = self._workflow_classes()
+        classes = None
+        for ask in (lambda: self.backend.node_classes(), lambda: self.backend.probe_node_classes(wanted)):
+            try:
+                classes = self._call(ask(), timeout=60)
+            except Exception:
+                classes = None
+            if classes:
+                break
+        if not classes:
+            # liste illisible : ComfyUI jugera ; un nœud facultatif refusé sera contourné à ce moment-là
+            self.notes.append(tr("liste des nœuds installés illisible (/object_info) : workflow envoyé tel quel ; "
+                                 "un nœud facultatif refusé par ComfyUI sera contourné à la première texture."))
+            self._set_denoise_scale()
+            return
+        self.notes += self._refit(wanted - classes)
+
+    def _set_denoise_scale(self) -> None:
+        cn = any(n.get("class_type") in CONTROLNET_APPLY for n in self.wf_main.graph.values())
+        self.denoise_scale = float(self.c.get("denoise_scale" if cn else "denoise_scale_no_cn", 1.0) or 1.0)
+
+    def _family(self) -> str:
+        name = Path(str(self.c.get("workflow") or "")).name.lower()
+        return next((f for f in ("sdxl", "sd15", "zimage") if f in name), "")
+
+    def _fit_models(self) -> None:
+        """Fichiers de modèles du workflow comparés à ceux de ComfyUI, avant toute texture. Un modèle par défaut
+        absent est remplacé par un équivalent présent (autre checkpoint SDXL, autre précision du même modèle) ;
+        sinon : workflow Tile+Canny désactivé, ou arrêt immédiat avec ce qui manque et où le mettre."""
+        cache: dict[tuple[str, str], list[str] | None] = {}
+
+        def options(cls: str, field: str) -> list[str] | None:
+            if (cls, field) not in cache:
+                try:
+                    cache[(cls, field)] = self._call(self.backend.input_options(cls, field), timeout=30)
+                except Exception:
+                    cache[(cls, field)] = None
+            return cache[(cls, field)]
+
+        family = self._family()
+        chosen = {"ckpt_name": self.c.get("checkpoint"), "control_net_name": self.c.get("controlnet_model"),
+                  "lora_name": self.c.get("lora")}
+        missing: list[tuple[str, str, str, list[str]]] = []
+        for role in ("main", "edges"):
+            wf = self._orig_main if role == "main" else self._orig_edges
+            if wf is None:
+                continue
+            graph = None
+            for nid, node in wf.graph.items():
+                if graph is not None and nid not in graph:
+                    continue                      # retiré avec le ControlNet « model patch »
+                cls = str(node.get("class_type"))
+                field = LOADER_FIELDS.get(cls)
+                val = node["inputs"].get(field) if field else None
+                if not isinstance(val, str):
+                    continue
+                avail = options(cls, field)
+                if avail is None or val in avail:
+                    continue                      # liste illisible : ComfyUI jugera
+                pick = None if str(chosen.get(field) or "").strip() else substitute_model(field, val, avail, family)
+                if not pick and cls == "ModelPatchLoader" and role == "main":
+                    graph = drop_model_patches(graph or wf.graph)
+                    self.notes.append(tr("ControlNet Tile « {val} » absent de ComfyUI (models\\model_patches) : "
+                                         "img2img sans ControlNet, denoise réduit. Avec lui, l'IA peut ajouter bien "
+                                         "plus de détail sans redessiner les formes.", val=val))
+                    continue
+                if pick:
+                    graph = graph or copy.deepcopy(wf.graph)
+                    graph[nid]["inputs"][field] = pick
+                    note = tr("modèle « {val} » absent de ComfyUI : « {pick} » utilisé à la place.", val=val, pick=pick)
+                    if note not in self.notes:            # même modèle dans les deux workflows : une seule remarque
+                        self.notes.append(note)
+                elif role == "edges":
+                    self._orig_edges = self.wf_edges = None
+                    self._edges_off = True
+                    self.notes.append(tr("workflow Tile+Canny désactivé : modèle « {val} » absent de ComfyUI (dossier "
+                                         "models\\{folder}) ; toutes les matières passent par le workflow Tile.",
+                                         val=val, folder=MODEL_DIRS.get(field, "")))
+                    graph = None
+                    break
+                else:
+                    missing.append((cls, field, val, avail))
+            if graph is not None:
+                new = self.chc.ComfyWorkflow(graph, wf.load_node_id, wf.output_node_ids, wf.preview_only)
+                if role == "main":
+                    self._orig_main = self.wf_main = new
+                else:
+                    self._orig_edges = self.wf_edges = new
+        if not missing:
+            return
+        parts = []
+        for _cls, field, val, avail in missing:
+            have = (tr("dossier vide") if not avail else
+                    tr("présents : {names}", names=", ".join(avail[:5]) + (" …" if len(avail) > 5 else "")))
+            src = MODEL_SOURCES.get(val)
+            parts.append(tr("« {val} » (models\\{folder}, {have})", val=val, folder=MODEL_DIRS.get(field, "?"),
+                            have=have) + (f" — {tr(src)}" if src else ""))
+        hint = ""
+        if any(f == "ckpt_name" for _c, f, _v, _a in missing):
+            unets = [u for u in (options("UNETLoader", "unet_name") or []) if "z_image" in u.lower() or "z-image" in u.lower()]
+            if unets:
+                hint = tr("ton ComfyUI n'a pas de checkpoint pour ce workflow mais il a Z-Image Turbo ({name}) : "
+                          "choisis la famille « Z-Image Turbo » dans TEXFORGE, sans rien télécharger. ", name=unets[0])
+        raise WorkflowFatal(hint + tr("modèles absents de ComfyUI : {items}. Après un ajout, redémarre ComfyUI puis "
+                                      "relance.", items=" ; ".join(parts)))
+
+    def _workflow_classes(self) -> set[str]:
+        return {str(n.get("class_type")) for wf in (self._orig_main, self._orig_edges) if wf is not None
+                for n in wf.graph.values()}
+
+    def _refit(self, missing: set[str]) -> list[str]:
+        """Workflows refaits depuis les originaux pour un serveur sans les nœuds `missing` ; renvoie les
+        remarques nouvelles. Lève WorkflowFatal si un nœud indispensable du workflow principal manque."""
+        if missing & {"ModelPatchLoader", "ZImageFunControlnet"}:
+            # ComfyUI trop ancien pour le ControlNet de Z-Image : workflow sans lui plutôt qu'un arrêt
+            wf = self._orig_main
+            self._orig_main = self.chc.ComfyWorkflow(drop_model_patches(wf.graph), wf.load_node_id,
+                                                     wf.output_node_ids, wf.preview_only)
+            missing = missing - {"ModelPatchLoader", "ZImageFunControlnet"}
+        available = self._workflow_classes() - missing
+        main, b, required = fit_workflow(self._orig_main, available, self.chc)
+        if required:
+            packs = sorted({NODE_PACKS[c] for c in required if c in NODE_PACKS})
+            raise WorkflowFatal(tr("nœuds absents de ComfyUI : {nodes}{packs}. Installe-les avec ComfyUI Manager "
+                                   "(Custom Nodes Manager) ou mets ComfyUI à jour, redémarre-le, puis relance.",
+                                   nodes=", ".join(sorted(required)),
+                                   packs=f" ({', '.join(packs)})" if packs else ""))
+        notes: list[str] = []
+        bypassed = set(b)
+        edges = None
+        if self._orig_edges is not None:
+            wf_edges, b, r = fit_workflow(self._orig_edges, available, self.chc)
+            if r:
+                # workflow « joints » inutilisable ici : toutes les matières passent par le workflow principal
+                if not self._edges_off:
+                    notes.append(tr("workflow Tile+Canny désactivé, nœuds absents : {nodes} ; toutes les "
+                                    "matières passent par le workflow Tile.", nodes=", ".join(r)))
+                self._edges_off = True
+            else:
+                edges = wf_edges
+                bypassed |= set(b)
+        new = bypassed - self._missing
+        self.wf_main, self.wf_edges = main, edges
+        self._missing |= missing
+        if new & TILING_CLASSES:
+            self.native_tiling = False                 # TEXFORGE prolonge les bords en boucle avant l'envoi
+            self._warned |= {"TEXFORGE_TILING", "TEXFORGE_TILING_VAE"}
+            notes.append(tr("nœuds de raccord absents ({nodes}, pack ComfyUI-seamless-tiling) : TEXFORGE "
+                            "prolonge lui-même les textures répétables en boucle avant la génération. Raccord "
+                            "natif : ComfyUI Manager → Custom Nodes Manager → « ComfyUI-seamless-tiling ».",
+                            nodes=", ".join(sorted(bypassed & TILING_CLASSES))))
+        if "ColorTransfer" in new:
+            notes.append(tr("nœud ColorTransfer absent : couleurs recalées par TEXFORGE après la génération."))
+        if "OffsetImage" in new:
+            notes.append(tr("nœud OffsetImage absent : aperçu du raccord dans ComfyUI désactivé (sans effet "
+                            "sur le résultat)."))
+        self._set_denoise_scale()
+        return notes
+
+    def _note(self, text: str) -> None:
+        self.notes.append(text)
+        if self.on_note is not None:
+            self.on_note(text)
+        else:
+            print(f"[COMFYUI] ⚠ {text}", file=sys.stderr)
+
+    def _missing_after_refusal(self, exc, wf) -> bool:
+        """Refus « nœud absent » d'un nœud facultatif : workflows refaits sans lui (et sans les autres
+        nœuds de son pack). False si le refus a une autre cause, ou concerne un nœud indispensable."""
+        cls = self.chc.missing_node_class(exc, wf.graph)
+        if not cls or cls not in BYPASS:
+            return False
+        with self._fit_lock:
+            if cls not in self._missing:
+                pack = NODE_PACKS.get(cls)
+                mates = {c for c, p in NODE_PACKS.items() if pack and p == pack} & self._workflow_classes()
+                for text in self._refit(self._missing | {cls} | mates):
+                    self._note(text)
+        return True
 
     # ------------------------------------------------------------ outils
     def _call(self, coro, timeout: float | None = None):
@@ -341,9 +542,10 @@ class ComfyUIProvider:
         body = ", ".join(x for x in (hint, str(preset.get("prompt", ""))) if x)
         prefix = self.c["prompt_prefix_tiled"] if tiling != "disable" else self.c["prompt_prefix"]
         edges = bool(preset.get("edges")) and self.wf_edges is not None
+        denoise = min(0.9, max(0.08, float(preset.get("denoise", 0.42)) * getattr(self, "denoise_scale", 1.0)))
         return {"material": material, "tiling": tiling, "edges": edges,
                 "prompt": f"{prefix}{body}{self.c['prompt_suffix']}", "negative": str(self.c["negative"]),
-                "denoise": float(preset.get("denoise", 0.42)), "cn_strength": float(preset.get("cn_strength", 0.75)),
+                "denoise": round(denoise, 3), "cn_strength": float(preset.get("cn_strength", 0.75)),
                 "stem": rec.get("name") or "texture"}
 
     # ------------------------------------------------------------ génération
@@ -351,7 +553,44 @@ class ComfyUIProvider:
                  aspect_ratio: str, seed: int, on_submitted: Callable[[str], None],
                  context: dict | None = None) -> tuple[Image.Image, str]:
         ctx = context or {}
-        wf = self.wf_edges if ctx.get("edges") and self.wf_edges is not None else self.wf_main
+        on_submitted(f"local-{uuid.uuid4().hex[:12]}")
+        tiles = ctx.get("tiles")
+        if tiles and max(image.size) > int(tiles["size"]):
+            return self._generate_tiled(image, ctx, prompt, negative, seed, int(tiles["size"]),
+                                        int(tiles["overlap"])), f"comfyui://{ctx.get('stem', 'texture')}"
+        return self._generate_one(image, ctx, prompt, negative, seed), f"comfyui://{ctx.get('stem', 'texture')}"
+
+    def _generate_tiled(self, image: Image.Image, ctx: dict, prompt: str, negative: str, seed: int,
+                        size: int, overlap: int) -> Image.Image:
+        """Image déjà à sa taille finale, générée morceau par morceau puis fondue : chaque morceau garde la
+        résolution native du modèle, donc le détail ajouté l'est à la taille finale."""
+        from .imaging import tile_starts, tile_weights
+        arr = np.asarray(image.convert("RGB"))
+        H, W = arr.shape[:2]
+        ys, xs = tile_starts(H, size, overlap), tile_starts(W, size, overlap)
+        acc = np.zeros((H, W, 3), np.float32)
+        wsum = np.zeros((H, W, 1), np.float32)
+        n = len(ys) * len(xs)
+        stem = str(ctx.get("stem", "texture"))
+        # raccord géré par la marge en boucle et le fondu final : jamais de padding circulaire par morceau
+        tctx = {**ctx, "tiling": "disable"}
+        for i, (y, x) in enumerate(((y, x) for y in ys for x in xs), 1):
+            th, tw = min(size, H - y), min(size, W - x)
+            piece = Image.fromarray(np.ascontiguousarray(arr[y:y + th, x:x + tw]), "RGB")
+            if self.backend.on_progress is not None:
+                self.backend.on_progress(tr("{stem} : morceau {i}/{n}", stem=stem, i=i, n=n))
+            out = self._generate_one(piece, {**tctx, "stem": f"{stem}_m{i:03d}"}, prompt, negative, seed,
+                                     tiled=True)
+            if out.size != (tw, th):
+                out = out.resize((tw, th), Image.LANCZOS)
+            wgt = tile_weights(th, tw, overlap, (y > 0, y + th < H, x > 0, x + tw < W))
+            acc[y:y + th, x:x + tw] += np.asarray(out, np.float32) * wgt
+            wsum[y:y + th, x:x + tw] += wgt
+        out = np.clip(acc / np.maximum(wsum, 1e-6) + 0.5, 0, 255).astype(np.uint8)
+        return Image.fromarray(out, "RGB")
+
+    def _generate_one(self, image: Image.Image, ctx: dict, prompt: str, negative: str, seed: int,
+                      tiled: bool = False) -> Image.Image:
         wanted = {
             ("TEXFORGE_PROMPT", "text"): ctx.get("prompt", prompt),
             ("TEXFORGE_NEGATIVE", "text"): ctx.get("negative", negative),
@@ -361,28 +600,160 @@ class ComfyUIProvider:
             ("TEXFORGE_TILING", "tiling"): ctx.get("tiling"),
             ("TEXFORGE_TILING_VAE", "tiling"): ctx.get("tiling"),
         }
-        overrides = {k: v for k, v in wanted.items() if v is not None and self._has(wf, k[0])}
-        on_submitted(f"local-{uuid.uuid4().hex[:12]}")
-        try:
-            blobs = self._call(self.backend.generate(image.convert("RGB"), str(ctx.get("stem", "texture")),
-                                                     overrides=overrides, workflow=wf),
-                               timeout=float(self.c["timeout"]) + 120)
-        except self.chc.ServerUnavailable as exc:
-            raise ServerDown(str(exc)) from exc
-        except self.chc.WorkflowError as exc:
-            raise WorkflowFatal(str(exc)) from exc
-        except self.chc.TextureError as exc:
-            if exc.kind in ("oom", "timeout", "interrupted", "http"):
-                raise TransientError(f"[{exc.kind}] {exc}") from exc
-            raise ProviderError(f"[{exc.kind}] {exc}") from exc
-        except TimeoutError as exc:
-            raise TransientError(tr("[timeout] pas de réponse de la boucle ComfyUI : {exc}", exc=exc)) from exc
+        native = self.native_tiling and not tiled   # préparation de l'image reçue (pipeline.do_ai)
+        last: Exception | None = None
+        for _ in range(len(BYPASS) + 1):
+            wf = self.wf_edges if ctx.get("edges") and self.wf_edges is not None else self.wf_main
+            overrides = {k: v for k, v in wanted.items() if v is not None and self._has(wf, k[0])}
+            try:
+                blobs = self._call(self.backend.generate(image.convert("RGB"), str(ctx.get("stem", "texture")),
+                                                         overrides=overrides, workflow=wf),
+                                   timeout=float(self.c["timeout"]) + 120)
+                break
+            except self.chc.ServerUnavailable as exc:
+                raise ServerDown(str(exc)) from exc
+            except self.chc.WorkflowError as exc:
+                if not self._missing_after_refusal(exc, wf):
+                    cls = self.chc.missing_node_class(exc, wf.graph)
+                    if cls:
+                        pack = f" ({NODE_PACKS[cls]})" if cls in NODE_PACKS else ""
+                        raise WorkflowFatal(tr("{exc} — type de nœud absent : {cls}{pack}. Installe-le avec ComfyUI "
+                                               "Manager (Custom Nodes Manager) ou mets ComfyUI à jour, redémarre-le, "
+                                               "puis relance.",
+                                               exc=exc, cls=cls, pack=pack)) from exc
+                    raise WorkflowFatal(str(exc)) from exc
+                if native and not self.native_tiling:
+                    # image préparée pour le raccord natif : à refaire, bords prolongés par TEXFORGE
+                    raise TransientError(tr("nœuds de raccord absents de ComfyUI : contournés, texture relancée "
+                                            "avec le raccord préparé par TEXFORGE")) from exc
+                last = exc
+                continue                     # autre nœud facultatif contourné : nouvel envoi
+            except self.chc.TextureError as exc:
+                if exc.kind in ("oom", "timeout", "interrupted", "http"):
+                    raise TransientError(f"[{exc.kind}] {exc}") from exc
+                raise ProviderError(f"[{exc.kind}] {exc}") from exc
+            except TimeoutError as exc:
+                raise TransientError(tr("[timeout] pas de réponse de la boucle ComfyUI : {exc}", exc=exc)) from exc
+        else:
+            raise WorkflowFatal(str(last))
         img = Image.open(io.BytesIO(blobs[0]))
         img.load()
-        return img.convert("RGB"), f"comfyui://{ctx.get('stem', 'texture')}"
+        return img.convert("RGB")
 
     def resume(self, request_id: str):
         raise ProviderError(tr("les requêtes locales ne se reprennent pas"))
+
+
+# Chargeurs de modèles : champ du fichier et dossier de ComfyUI (models\<dossier>)
+LOADER_FIELDS = {"CheckpointLoaderSimple": "ckpt_name", "CheckpointLoader": "ckpt_name",
+                 "ControlNetLoader": "control_net_name", "UNETLoader": "unet_name", "CLIPLoader": "clip_name",
+                 "VAELoader": "vae_name", "LoraLoader": "lora_name", "LoraLoaderModelOnly": "lora_name",
+                 "ModelPatchLoader": "name", "UpscaleModelLoader": "model_name"}
+MODEL_DIRS = {"ckpt_name": "checkpoints", "control_net_name": "controlnet", "unet_name": "diffusion_models",
+              "clip_name": "text_encoders", "vae_name": "vae", "lora_name": "loras", "name": "model_patches",
+              "model_name": "upscale_models"}
+MODEL_SOURCES = {
+    "juggernautXL_ragnarok.safetensors": N_("n'importe quel checkpoint SDXL convient, ex. huggingface.co/RunDiffusion/"
+                                            "Juggernaut-XL-v9 (7,1 Go)"),
+    "xinsir-controlnet-tile-sdxl-1.0.safetensors": N_("huggingface.co/xinsir/controlnet-tile-sdxl-1.0 "
+                                                      "(diffusion_pytorch_model.safetensors, 2,5 Go, à renommer ainsi)"),
+    "xinsir-controlnet-union-sdxl-1.0-promax.safetensors": N_("huggingface.co/xinsir/controlnet-union-sdxl-1.0 "
+                                                              "(diffusion_pytorch_model_promax.safetensors, 2,5 Go, à "
+                                                              "renommer ainsi)"),
+    "realisticVisionV60B1_v51VAE.safetensors": N_("n'importe quel checkpoint SD 1.5 convient"),
+    "control_v11f1e_sd15_tile.pth": N_("huggingface.co/lllyasviel/ControlNet-v1-1"),
+    "z_image_turbo_bf16.safetensors": N_("huggingface.co/Comfy-Org/z_image_turbo"),
+    "qwen_3_4b.safetensors": N_("huggingface.co/Comfy-Org/z_image_turbo"),
+    "ae.safetensors": N_("huggingface.co/Comfy-Org/z_image_turbo"),
+}
+_PRECISION = re.compile(r"[_-](bf16|fp16|fp32|fp8(_e4m3fn|_e5m2)?(_scaled)?|int8|q\d(_k)?(_[sm])?|q8_0)$")
+
+
+def _model_stem(name: str) -> str:
+    stem = re.sub(r"\.(safetensors|ckpt|pth|pt|bin|gguf|sft)$", "", Path(name.replace("\\", "/")).name.lower())
+    return _PRECISION.sub("", stem)
+
+
+def substitute_model(field: str, wanted: str, available: list[str], family: str) -> str | None:
+    """Équivalent présent d'un modèle par défaut absent, ou None : checkpoint de la même famille (SDXL / SD 1.5),
+    ControlNet du même type (tile, union, canny) et de la même famille, ou autre précision du même modèle."""
+    low = {a: a.lower() for a in available}
+    if field == "ckpt_name":
+        if family == "sdxl":
+            cands = [a for a, s in low.items() if "xl" in s and "refiner" not in s]
+        elif family == "sd15":
+            cands = [a for a, s in low.items() if "xl" not in s]
+        else:
+            cands = []
+        return sorted(cands, key=lambda a: ("juggernaut" not in low[a], low[a]))[0] if cands else None
+    if field == "control_net_name":
+        kind = next((k for k in ("tile", "union", "canny") if k in wanted.lower()), "")
+        if not kind:
+            return None
+        cands = [a for a, s in low.items() if kind in s and (family not in ("sdxl", "sd15") or ("xl" in s) == (family == "sdxl"))]
+        return sorted(cands)[0] if cands else None
+    if field in ("unet_name", "clip_name", "vae_name", "name"):
+        cands = [a for a in available if _model_stem(a) == _model_stem(wanted)]
+        return sorted(cands)[0] if cands else None
+    return None
+
+
+# Nœuds facultatifs du workflow : sortie = entrée indiquée quand le serveur ne les a pas
+BYPASS = {"SeamlessTile": "model", "MakeCircularVAE": "vae", "ColorTransfer": "image_target", "OffsetImage": "pixels",
+          "ZImageFunControlnet": "model"}
+CONTROLNET_APPLY = {"ControlNetApplyAdvanced", "ControlNetApply", "ZImageFunControlnet", "QwenImageDiffsynthControlnet"}
+
+
+def drop_model_patches(graph: dict) -> dict:
+    """Retire les ControlNet « model patch » (Z-Image) d'un graphe : chargeur supprimé, nœud d'application
+    contourné (ce qui lisait son MODEL lit celui d'avant). Sert quand le fichier ou les nœuds manquent."""
+    g = copy.deepcopy(graph)
+    for nid in [n for n, node in g.items() if node.get("class_type") == "ModelPatchLoader"]:
+        for aid in [a for a, node in g.items() if any(isinstance(v, list) and len(v) == 2 and str(v[0]) == str(nid)
+                                                       for v in node["inputs"].values())]:
+            src = g[aid]["inputs"].get(BYPASS.get(g[aid].get("class_type"), ""))
+            if isinstance(src, list) and len(src) == 2:
+                for other in g.values():
+                    for key, val in other["inputs"].items():
+                        if isinstance(val, list) and len(val) == 2 and str(val[0]) == str(aid):
+                            other["inputs"][key] = list(src)
+            del g[aid]
+        del g[nid]
+    return g
+TILING_CLASSES = {"SeamlessTile", "MakeCircularVAE"}
+NODE_PACKS = {"SeamlessTile": "ComfyUI-seamless-tiling", "MakeCircularVAE": "ComfyUI-seamless-tiling",
+              "OffsetImage": "ComfyUI-seamless-tiling"}
+
+
+def fit_workflow(wf, available: set[str], chc):
+    """(workflow, nœuds contournés, nœuds indispensables absents) pour un serveur qui ne connaît que
+    `available`. Un nœud contourné est retiré ; ce qui lisait sa sortie lit son entrée à la place."""
+    graph = copy.deepcopy(wf.graph)
+    bypassed: list[str] = []
+    required: list[str] = []
+    for nid in list(graph):
+        node = graph[nid]
+        ct = node.get("class_type")
+        if ct in available:
+            continue
+        src = node["inputs"].get(BYPASS.get(ct, ""))
+        if not (isinstance(src, list) and len(src) == 2):
+            required.append(ct)
+            continue
+        for other in graph.values():
+            for key, val in other["inputs"].items():
+                if isinstance(val, list) and len(val) == 2 and str(val[0]) == str(nid):
+                    other["inputs"][key] = list(src)
+        del graph[nid]
+        bypassed.append(ct)
+    if not bypassed:
+        return wf, [], sorted(set(required))
+    if "OffsetImage" in bypassed:              # l'aperçu du raccord n'a plus rien à montrer
+        for nid in [n for n, node in graph.items()
+                    if str((node.get("_meta") or {}).get("title", "")) == "TEXFORGE_SEAM_PREVIEW"]:
+            del graph[nid]
+    outs = [o for o in wf.output_node_ids if o in graph]
+    return chc.ComfyWorkflow(graph, wf.load_node_id, outs, wf.preview_only), sorted(set(bypassed)), sorted(set(required))
 
 
 def customize_workflow(wf, c: dict, chc):
