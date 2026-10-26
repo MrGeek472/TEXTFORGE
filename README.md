@@ -1,7 +1,7 @@
 <img width="1200" height="750" alt="Original" src="https://github.com/user-attachments/assets/55b996fd-99e7-4d95-90f6-a5ee84477810" />
 Original
 <img width="3600" height="2250" alt="IA" src="https://github.com/user-attachments/assets/7fac8a37-5dda-420a-a474-d3f121c4715e" />
-IA
+Intelligence artificiel
 
 
 
