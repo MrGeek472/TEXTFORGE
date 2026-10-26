@@ -1,3 +1,8 @@
+<img width="1000" height="733" alt="Original" src="https://github.com/user-attachments/assets/bab0a8c9-d7ac-48d0-8444-2ccc3c5040f6" />
+Original
+<img width="4000" height="2932" alt="IA" src="https://github.com/user-attachments/assets/fc57092d-ea20-496f-990d-c9dc8cb403bf" />
+Intelligence artificiel
+
 # TEXFORGE
 
 Remaster IA des textures de jeux PC anciens (DirectX 9 et antérieurs), en traitement
