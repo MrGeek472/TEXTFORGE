@@ -890,6 +890,8 @@ def _project_copy(dest: Path, version: str) -> Path:
     import re as _re
     init.write_text(_re.sub(r'__version__ = "[^"]+"', f'__version__ = "{version}"', init.read_text(encoding="utf-8")),
                     encoding="utf-8")
+    from .updater import write_release
+    write_release(dest)
     return dest
 
 
@@ -912,6 +914,7 @@ def _selftest_update(tmp: Path, failures: list) -> None:
     (good / "texforge" / "nouveau_module.py").write_text("VALEUR = 1\n", encoding="utf-8")
     eta = good / "texforge" / "eta.py"
     eta.write_text(eta.read_text(encoding="utf-8") + "\n# modifié dans le dépôt\n", encoding="utf-8")
+    updater.write_release(good)
     before = _digest(root)
     saved = {k: os.environ.get(k) for k in ("TEXFORGE_UPDATE_REPO", "TEXFORGE_UPDATE_API", "TEXFORGE_UPDATE_RAW",
                                              "TEXFORGE_UPDATE_CODELOAD", "TEXFORGE_UPDATE_DIR", "TEXFORGE_UPDATE_ROOT")}
@@ -944,22 +947,27 @@ def _selftest_update(tmp: Path, failures: list) -> None:
                     "erreur de syntaxe dans le dépôt")
             refused(lambda: gh.extra.update({"../evil.py": b"x = 1\n"}), gh.extra.clear, "evil.py",
                     "chemin sortant du dossier dans l'archive")
+            app = good / "app_gui.py"
+            app_data = app.read_bytes()
+            refused(lambda: app.write_bytes(app_data + b"\n# ancien fichier\n"), lambda: app.write_bytes(app_data),
+                    "app_gui.py", "envoi partiel sur GitHub (app_gui.py ancien, texforge/ neuf)")
 
             pip_calls = []
             real_pip = updater._pip_install
             updater._pip_install = lambda req, py, say: pip_calls.append(req.name)
             req = good / "requirements.txt"
             req.write_text(req.read_text(encoding="utf-8") + "rich>=13\n", encoding="utf-8")
+            updater.write_release(good)
             try:
                 logs: list[str] = []
                 res = updater.apply(updater.check(), log=logs.append)
             finally:
                 updater._pip_install = real_pip
             after = _digest(root)
-            _check(res["to"] == "99.0.0" and res["added"] == 1 and res["replaced"] == 3
+            _check(res["to"] == "99.0.0" and res["added"] == 1 and res["replaced"] == 4
                    and updater.installed_version(root) == "99.0.0" and after == _digest(good)
                    and pip_calls == ["requirements.txt"],
-                   f"installée : {res['replaced']} fichiers remplacés (version, eta.py, requirements), "
+                   f"installée : {res['replaced']} fichiers remplacés (version, eta.py, requirements, liste de la version), "
                    f"{res['added']} ajouté, dépendances installées par pip, copie identique au dépôt", failures)
             again = updater.check()
             _check(again["restart"] and not again["available"] and again["backup"] == __version__,
@@ -983,6 +991,124 @@ def _selftest_update(tmp: Path, failures: list) -> None:
                 os.environ.pop(k, None)
             else:
                 os.environ[k] = v
+
+
+class _FakeHTTP:
+    """Petit serveur local de test : handler(méthode, chemin, corps JSON) -> (code, objet JSON)."""
+
+    def __init__(self, handler) -> None:
+        import http.server
+        import threading
+        outer = self
+        self.calls: list[tuple[str, str, object]] = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def _go(self, method):
+                n = int(self.headers.get("Content-Length") or 0)
+                body = json.loads(self.rfile.read(n)) if n else None
+                outer.calls.append((method, self.path, body))
+                code, obj = handler(method, self.path, body)
+                data = json.dumps(obj).encode()
+                self.send_response(code)
+                self.send_header("Content-Type", "application/json")
+                self.send_header("Content-Length", str(len(data)))
+                self.end_headers()
+                self.wfile.write(data)
+
+            def do_GET(self):
+                self._go("GET")
+
+            def do_POST(self):
+                self._go("POST")
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.url = f"http://127.0.0.1:{self.server.server_address[1]}"
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
+
+    def close(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _selftest_prompt(failures: list) -> None:
+    """Prompt détaillé en anglais : ComfyUI (TextGenerate + Qwen3-4B de Z-Image), repli LM Studio / Ollama."""
+    import os
+
+    from . import prompt_enhance as pe
+
+    answer = '<think></think>\nHere is the prompt:\nPrompt: "Worn green armor plates, deep scratches, chipped paint, ' \
+             'gold reflective visor, fine dust in the seams"'
+
+    def comfy(with_textgen: bool):
+        def handler(method, path, body):
+            if path.startswith("/object_info/"):
+                cls = path.rsplit("/", 1)[-1]
+                if cls == "CLIPLoader":
+                    return 200, {cls: {"input": {"required": {"clip_name": [["clip_l.safetensors",
+                                                                             "qwen_3_4b.safetensors"]],
+                                                              "type": [["stable_diffusion", "lumina2"]]}}}}
+                if cls == "TextGenerate" and not with_textgen:
+                    return 200, {}
+                return 200, {cls: {"input": {}}}
+            if path == "/prompt":
+                return 200, {"prompt_id": "p1", "number": 1}
+            if path == "/history/p1":
+                return 200, {"p1": {"status": {"status_str": "success", "completed": True},
+                                    "outputs": {"4": {"text": [answer]}}}}
+            return 404, {}
+        return handler
+
+    srv = _FakeHTTP(comfy(True))
+    saved = os.environ.get("TEXFORGE_LLM_URL")
+    os.environ["TEXFORGE_LLM_URL"] = "http://127.0.0.1:9/v1"           # pas de LM Studio pendant le test
+    try:
+        res = pe.enhance("armure verte rayée, visière dorée", srv.url, "faithful", "zimage", seed=7)
+        graph = next(b for m, pth, b in srv.calls if pth == "/prompt")["prompt"]
+        gen = graph["3"]["inputs"]
+        _check(res["prompt"].startswith("Worn green armor") and '"' not in res["prompt"]
+               and "Prompt:" not in res["prompt"] and "Qwen3-4B" in res["engine"],
+               f"ComfyUI : prompt détaillé nettoyé ({res['words']} mots, {res['engine']})", failures)
+        _check(graph["1"]["inputs"] == {"clip_name": "qwen_3_4b.safetensors", "type": "lumina2"}
+               and gen["system_prompt"] == ["2", 0] and gen["sampling_mode"] == "on"
+               and gen["sampling_mode.seed"] == 7 and gen["thinking"] is False
+               and "English" in graph["2"]["inputs"]["value"] and "70 to 130 words" in graph["2"]["inputs"]["value"]
+               and graph["4"]["inputs"]["source"] == ["3", 0],
+               "graphe ComfyUI : encodeur Qwen3-4B de Z-Image, TextGenerate, consignes en système, PreviewAny",
+               failures)
+        short = pe.system_prompt("photoreal", "sdxl")
+        _check("30 to 60 words" in short and "photograph" in short and "albedo" not in short
+               and "albedo" in pe.system_prompt("faithful", "zimage"),
+               "consignes : courtes pour SDXL (CLIP), photo en photoréaliste, éclairage neutre en fidèle", failures)
+        srv.close()
+
+        srv = _FakeHTTP(comfy(False))
+        llm = _FakeHTTP(lambda m, pth, b: (200, {"data": [{"id": "nomic-embed"}, {"id": "qwen3-8b"}]})
+                        if pth == "/v1/models" else (200, {"choices": [{"message": {"content": answer}}]}))
+        os.environ["TEXFORGE_LLM_URL"] = f"{llm.url}/v1"
+        res = pe.enhance("mur de briques", srv.url, "faithful", "sdxl")
+        chat = next(b for m, pth, b in llm.calls if pth == "/v1/chat/completions")
+        _check(res["prompt"].startswith("Worn green armor") and "qwen3-8b" in res["engine"]
+               and chat["model"] == "qwen3-8b" and chat["messages"][0]["role"] == "system"
+               and chat["messages"][1]["content"] == "mur de briques",
+               f"ComfyUI sans TextGenerate : repli sur un serveur compatible OpenAI ({res['engine']})", failures)
+        llm.close()
+        os.environ["TEXFORGE_LLM_URL"] = "http://127.0.0.1:9/v1"
+        try:
+            pe.enhance("mur", srv.url)
+            ok, msg = False, ""
+        except pe.EnhanceError as exc:
+            ok, msg = True, str(exc)
+        _check(ok and "TextGenerate" in msg and "LM Studio" in msg,
+               "aucun modèle de langage : message qui dit quoi installer", failures)
+    finally:
+        srv.close()
+        if saved is None:
+            os.environ.pop("TEXFORGE_LLM_URL", None)
+        else:
+            os.environ["TEXFORGE_LLM_URL"] = saved
 
 
 def main() -> int:
@@ -1212,6 +1338,9 @@ def main() -> int:
 
         print("18. Mise à jour depuis GitHub (faux serveur local)")
         _selftest_update(tmp, failures)
+
+        print("19. Prompt détaillé en anglais (aperçu)")
+        _selftest_prompt(failures)
     except Exception:
         traceback.print_exc()
         failures.append("exception")

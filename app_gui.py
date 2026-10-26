@@ -53,7 +53,7 @@ if importlib.util.find_spec("PySide6") is None:          # message clair plutôt
 from PySide6.QtCore import (QDateTime, QLibraryInfo, QLocale, QObject, QPointF, QRunnable, QSettings, Qt,  # noqa: E402
                             QThread, QThreadPool, QTimer, QTranslator, QUrl, Signal, Slot)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon,  # noqa: E402
-                           QPainter, QPalette, QPixmap)
+                           QPainter, QPalette, QPixmap, QTextCursor)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,  # noqa: E402
                                QFileDialog, QFormLayout, QFrame, QGridLayout, QGroupBox,
                                QHBoxLayout, QHeaderView, QLabel, QLineEdit, QMainWindow, QMenu, QMessageBox,
@@ -61,9 +61,11 @@ from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComb
                                QSpinBox, QSplitter, QTableWidget, QTableWidgetItem, QToolButton, QVBoxLayout,
                                QWidget)
 
+from gui_compare import ComparePanel  # noqa: E402
 from texforge import __version__  # noqa: E402
 from texforge.ba2 import mod_output_for  # noqa: E402
-from texforge.detect import Candidate, Located, check_input, empty_input_help, inject_for, locate_textures  # noqa: E402
+from texforge.detect import (FEW_IMAGES, Candidate, Located, check_input, empty_input_help, inject_for,  # noqa: E402
+                             locate_textures)
 from texforge.detect import detect as find_texture_dirs  # noqa: E402
 from texforge.esrgan import INSTALL_DIR, RELEASES, find_realesrgan, install_realesrgan, platform_key  # noqa: E402
 from texforge.events import _fmt as format_event  # noqa: E402
@@ -71,7 +73,13 @@ from texforge.i18n import LANGUAGES, N_, get_lang, set_lang, tr  # noqa: E402
 from texforge.i18n import detect as detect_language  # noqa: E402
 from texforge.qc import LABELS as QC_LABELS  # noqa: E402
 from texforge.remaster import (EXIT_ERRORS, EXIT_FATAL, EXIT_OK, EXIT_STOPPED, STAGE_LABELS,  # noqa: E402
-                               RemasterSettings, material_presets, work_dir_of)
+                               AUTO_DENOISE, DENOISE_SCALE, PHOTOREAL, RemasterSettings, effective,
+                               material_presets, work_dir_of)
+from texforge.config import DEFAULTS  # noqa: E402
+from texforge.providers import compose_prompt  # noqa: E402
+from texforge.eta import fmt as fmt_estimate  # noqa: E402
+from texforge import updater  # noqa: E402
+from texforge.prompt_enhance import enhance as enhance_prompt  # noqa: E402
 
 APP_NAME = "TEXFORGE"
 
@@ -101,6 +109,7 @@ QGroupBox::title {{
 }}
 QLabel#hint {{ color: {C['muted']}; font-size: 9pt; }}
 QLabel#warn {{ color: {C['yellow']}; font-size: 9pt; }}
+QLabel#eta {{ color: {C['cyan']}; font-size: 9pt; }}
 QLabel#value {{ color: {C['accent_hi']}; font-family: Consolas, 'Cascadia Mono', monospace; min-width: 38px; }}
 
 QLineEdit, QComboBox, QSpinBox, QDoubleSpinBox {{
@@ -153,6 +162,9 @@ QProgressBar {{
 QProgressBar::chunk {{ border-radius: 4px;
     background: qlineargradient(x1:0, y1:0, x2:1, y2:0, stop:0 {C['accent_lo']}, stop:1 {C['accent_hi']}); }}
 
+QPlainTextEdit#prompt {{
+    background: {C['bg2']}; border: 1px solid {C['line']}; border-radius: 4px; padding: 3px;
+}}
 QPlainTextEdit#console {{
     background: #0e1013; border: 1px solid {C['line']}; border-radius: 4px; padding: 6px;
     selection-background-color: {C['bg3']};
@@ -174,6 +186,16 @@ QLabel#pill {{ border-radius: 9px; padding: 3px 10px; font-size: 9pt; font-weigh
 QLabel#pill[state="ok"] {{ background: #12352a; color: {C['green']}; }}
 QLabel#pill[state="ko"] {{ background: #3a1517; color: {C['red']}; }}
 QLabel#pill[state="busy"] {{ background: #3a2a10; color: {C['yellow']}; }}
+QPushButton#updatePill {{ border: none; border-radius: 9px; padding: 3px 10px; font-size: 9pt; font-weight: 600;
+    background: {C['bg3']}; color: {C['muted']}; }}
+QPushButton#updatePill:hover {{ color: {C['text']}; }}
+QPushButton#updatePill[state="available"], QPushButton#updatePill[state="restart"] {{
+    background: #12352a; color: {C['green']}; }}
+QPushButton#updatePill[state="available"]:hover, QPushButton#updatePill[state="restart"]:hover {{ color: #6ff0b4; }}
+QPushButton#updateBtn {{ background: #1d6b45; border: 1px solid {C['green']}; color: white; font-weight: 600;
+    padding: 4px 12px; }}
+QPushButton#updateBtn:hover {{ background: #24855a; color: white; }}
+QPushButton#updateBtn:disabled {{ background: {C['bg3']}; color: {C['dim']}; border-color: {C['line']}; }}
 QLabel#stage {{ border-radius: 4px; padding: 4px 10px; background: {C['bg2']}; color: {C['dim']}; font-weight: 600; }}
 QLabel#stage[state="active"] {{ background: {C['accent_lo']}; color: white; }}
 QLabel#stage[state="done"] {{ background: #12352a; color: {C['green']}; }}
@@ -398,6 +420,11 @@ class _TaskSignals(QObject):
     done = Signal(object)
 
 
+class _TextBridge(QObject):
+    """Lignes de journal d'une tâche de fond vers le thread de l'interface."""
+    line = Signal(str)
+
+
 class Task(QRunnable):
     """Petite tâche d'arrière-plan (QThreadPool) dont le résultat revient par signal."""
 
@@ -427,8 +454,10 @@ def probe_comfyui(server: str) -> dict:
     dev = (stats.get("devices") or [{}])[0]
     out = {"ok": True, "version": (stats.get("system") or {}).get("comfyui_version", "?"),
            "gpu": re.sub(r"^cuda:\d+\s*", "", str(dev.get("name", "?"))).split(" : ")[0].strip(),
-           "vram_free": dev.get("vram_free"), "vram_total": dev.get("vram_total"), "checkpoints": [], "loras": []}
-    for node, field, key in (("CheckpointLoaderSimple", "ckpt_name", "checkpoints"), ("LoraLoader", "lora_name", "loras")):
+           "vram_free": dev.get("vram_free"), "vram_total": dev.get("vram_total"), "checkpoints": [], "loras": [],
+           "unets": []}
+    for node, field, key in (("CheckpointLoaderSimple", "ckpt_name", "checkpoints"), ("LoraLoader", "lora_name", "loras"),
+                             ("UNETLoader", "unet_name", "unets")):
         try:
             out[key] = combo_options(http_json(f"{base}/object_info/{node}", timeout=5), node, field)
         except (urllib.error.URLError, OSError, ValueError):
@@ -607,6 +636,77 @@ class LogConsole(QPlainTextEdit):
         self.clear()
 
 
+class PromptPreviewDialog(QDialog):
+    """Aperçu du prompt détaillé en anglais : modifiable, régénérable, appliqué seulement sur demande."""
+
+    def __init__(self, parent, source: str, generate) -> None:
+        super().__init__(parent)
+        self.setWindowTitle(tr("Prompt détaillé en anglais — aperçu"))
+        self.resize(680, 440)
+        self._generate = generate                        # generate(on_status, on_done)
+        self._busy = False
+        lay = QVBoxLayout(self)
+        head = QLabel(tr("Ton texte :"))
+        head.setObjectName("hint")
+        src = QLabel(source)
+        src.setWordWrap(True)
+        src.setTextFormat(Qt.PlainText)
+        src.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        lay.addWidget(head)
+        lay.addWidget(src)
+        lay.addSpacing(6)
+        lay.addWidget(QLabel(tr("Prompt proposé (modifiable avant de l'utiliser) :")))
+        self.result = QPlainTextEdit()
+        self.result.setObjectName("prompt")
+        lay.addWidget(self.result, 1)
+        self.info = QLabel("")
+        self.info.setObjectName("hint")
+        self.info.setWordWrap(True)
+        lay.addWidget(self.info)
+        row = QHBoxLayout()
+        self.btn_again = QPushButton(tr("↻ Régénérer"))
+        self.btn_again.clicked.connect(self.run)
+        self.btn_use = QPushButton(tr("Utiliser ce prompt"))
+        self.btn_use.setDefault(True)
+        self.btn_use.clicked.connect(self.accept)
+        cancel = QPushButton(tr("Annuler"))
+        cancel.clicked.connect(self.reject)
+        row.addWidget(self.btn_again)
+        row.addStretch(1)
+        row.addWidget(cancel)
+        row.addWidget(self.btn_use)
+        lay.addLayout(row)
+        self.result.textChanged.connect(self._sync)
+        self._sync()
+
+    def prompt(self) -> str:
+        return re.sub(r"\s+", " ", self.result.toPlainText()).strip()
+
+    def _sync(self) -> None:
+        self.btn_use.setEnabled(not self._busy and bool(self.prompt()))
+        self.btn_again.setEnabled(not self._busy)
+
+    def run(self) -> None:
+        if self._busy:
+            return
+        self._busy = True
+        self.result.setReadOnly(True)
+        self.info.setText(tr("Génération en cours…"))
+        self._sync()
+        self._generate(self.info.setText, self._done)
+
+    def _done(self, res: dict) -> None:
+        self._busy = False
+        self.result.setReadOnly(False)
+        if "error" in res:
+            self.info.setText(re.sub(r"^\w*Error: ", "", str(res["error"])))
+        else:
+            self.result.setPlainText(res["prompt"])
+            self.info.setText(tr("{engine} · {words} mots · {s} s", engine=res["engine"], words=res["words"],
+                                 s=res["seconds"]))
+        self._sync()
+
+
 class QcReportDialog(QDialog):
     """Rapport QC lisible : une ligne par texture, triable, filtrable par décision."""
 
@@ -682,8 +782,11 @@ class QcReportDialog(QDialog):
 # ===================================================================== fenêtre principale
 
 # libellés traduits à l'affichage : tr(libellé)
+STYLES = [("faithful", N_("Fidèle — textures de jeu, DA conservée")),
+          ("photoreal", N_("Photoréaliste créatif — invente du détail"))]
 FAMILIES = [("sdxl", N_("SDXL — ControlNet Tile (+ Canny pour les joints)")),
             ("sd15", N_("SD 1.5 — ControlNet Tile (moins de VRAM)")),
+            ("zimage", N_("Z-Image Turbo — ControlNet Tile (model patch) si présent")),
             ("custom", N_("Workflow personnalisé (export API)"))]
 DDS_FORMATS = [("match", N_("Identique à l'original (recommandé)")),
                ("auto", N_("Auto : BC1/DXT1 opaque · BC3/DXT5 alpha")),
@@ -702,6 +805,7 @@ STAGE_SHORT = {"scan": N_("1 · SCAN & ROUTAGE"), "generate": N_("2 · GÉNÉRAT
 # traductions Qt (boutons Oui / Non, menus contextuels…) installées pour la langue choisie
 _QT_TRANSLATORS: list[QTranslator] = []
 _ACTIVE: dict = {}                       # fenêtre principale en cours
+UPDATE_EVERY_MS = 2 * 60 * 1000          # vérification des mises à jour : au démarrage puis toutes les 2 min
 
 
 def apply_language(app: QApplication, code: str | None) -> str:
@@ -723,7 +827,10 @@ class MainWindow(QMainWindow):
         super().__init__()
         self.setWindowTitle(f"{APP_NAME} {__version__} — {tr('remaster de textures')}")
         self.setWindowIcon(app_icon())
-        self.resize(1360, 860)
+        screen = QGuiApplication.primaryScreen()
+        avail = screen.availableGeometry() if screen is not None else None
+        # trois colonnes : réglages, déroulement, avant / après
+        self.resize(min(1800, avail.width() - 40) if avail else 1800, min(940, avail.height() - 40) if avail else 940)
         self.setMinimumSize(1040, 700)
         self.qs = QSettings(APP_NAME, APP_NAME)
         self.pool = QThreadPool.globalInstance()
@@ -732,6 +839,8 @@ class MainWindow(QMainWindow):
         self.stop_phase = 0                      # 0 : en marche, 1 : arrêt propre demandé
         self.launching = False                   # test du serveur en cours avant un lancement
         self.t_start = 0.0
+        self._eta_end: float | None = None       # instant (monotonic) de fin prévu du lancement
+        self._eta_first: float | None = None     # première durée totale annoncée, rappelée à la fin
         self.last_end: dict = {}
         self.counts: dict[str, int] = {}
         self._tasks: set[Task] = set()
@@ -754,9 +863,16 @@ class MainWindow(QMainWindow):
         self.splitter = QSplitter(Qt.Horizontal)
         self.splitter.addWidget(self._build_settings())
         self.splitter.addWidget(self._build_run_panel())
+        self.compare = ComparePanel(self._run_task)
+        self.splitter.addWidget(self.compare)
         self.splitter.setStretchFactor(0, 0)
         self.splitter.setStretchFactor(1, 1)
-        self.splitter.setSizes([470, 890])
+        self.splitter.setStretchFactor(2, 1)
+        self.splitter.setCollapsible(2, True)
+        self.splitter.setSizes([430, 560, 780])
+        shown = self.qs.value("compare_visible", True, type=bool)
+        self.compare.setVisible(shown)
+        self.btn_compare.setChecked(shown)
         body.addWidget(self.splitter, 1)
         self.statusBar().setStyleSheet(f"color: {C['muted']};")
 
@@ -778,6 +894,20 @@ class MainWindow(QMainWindow):
         self._fill_detect_menu()
         QTimer.singleShot(0, lambda: self.start_detection(auto_fill=True))
         QTimer.singleShot(300, self.test_server)
+        self.update_info: dict = {}
+        self._update_checking = False
+        self._updating = False                   # téléchargement / installation d'une mise à jour
+        self._update_checked_at = 0.0
+        self.update_timer = QTimer(self)
+        self.update_timer.setInterval(UPDATE_EVERY_MS)
+        self.update_timer.timeout.connect(self._auto_check_update)
+        self.update_timer.start()
+        cached = _ACTIVE.get("update")
+        if cached and time.time() - cached[0] < UPDATE_EVERY_MS / 1000:   # nouvelle fenêtre (changement de langue)
+            self.update_info, self._update_checked_at = dict(cached[1]), cached[0]
+            QTimer.singleShot(0, self._paint_update)
+        else:
+            QTimer.singleShot(2500, self._auto_check_update)
 
     # ----------------------------------------------------------------- construction
     def _build_header(self) -> QWidget:
@@ -809,10 +939,31 @@ class MainWindow(QMainWindow):
         lay.addSpacing(8)
         lay.addLayout(col)
         lay.addStretch(1)
+        self.btn_compare = QPushButton(tr("◧ Avant / Après"))
+        self.btn_compare.setCheckable(True)
+        self.btn_compare.setToolTip(tr("Afficher ou masquer le panneau avant / après (original à gauche, IA à droite)"))
+        self.btn_compare.toggled.connect(self._toggle_compare)
+        lay.addWidget(self.btn_compare)
+        lay.addSpacing(12)
         lay.addWidget(globe)
         lay.addWidget(self.lang_combo)
         lay.addSpacing(12)
         lay.addWidget(self.server_pill)
+        # coin haut droit : mise à jour depuis le dépôt GitHub (pastille grise : à jour, verte : disponible)
+        self.update_btn = QPushButton(tr("⬇ Mettre à jour"))
+        self.update_btn.setObjectName("updateBtn")
+        self.update_btn.setCursor(Qt.PointingHandCursor)
+        self.update_btn.setVisible(False)
+        self.update_btn.clicked.connect(self._on_update_clicked)
+        self.update_pill = QPushButton(f"● v{__version__}")
+        self.update_pill.setObjectName("updatePill")
+        self.update_pill.setProperty("state", "none")
+        self.update_pill.setCursor(Qt.PointingHandCursor)
+        self.update_pill.setToolTip(tr("Mises à jour : vérification au démarrage…"))
+        self.update_pill.clicked.connect(self._update_menu)
+        lay.addSpacing(10)
+        lay.addWidget(self.update_btn)
+        lay.addWidget(self.update_pill)
         return f
 
     def _build_folders(self) -> QWidget:
@@ -946,6 +1097,7 @@ class MainWindow(QMainWindow):
         for key, label in FAMILIES:
             self.family.addItem(tr(label), key)
         self.family.currentIndexChanged.connect(self._refresh_dependent)
+        self.family.activated.connect(lambda _i: self.qs.setValue("family_chosen", True))   # choix à la main
         form.addRow(tr("Famille"), self.family)
         self.workflow_row = PathRow("workflow_api.json", file_filter=tr("Workflow API (*.json)"),
                                     dialog_title=tr("Workflow ComfyUI (format API)"))
@@ -982,14 +1134,71 @@ class MainWindow(QMainWindow):
         box = QGroupBox(tr("PHOTORÉALISME / FIDÉLITÉ À LA DA"))
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
-        self.denoise = ValueSlider(0.20, 0.60, 0.01, 0.42)
+        self.style = QComboBox()
+        for key, label in STYLES:
+            self.style.addItem(tr(label), key)
+        self.style.setToolTip(tr("Fidèle : textures de jeu, la DA et les formes sont conservées, le contrôle qualité "
+                                 "rejette ce qui s'en écarte.\nPhotoréaliste créatif : le modèle voit l'image entière, "
+                                 "invente matière et détail (denoise jusqu'à 1),\npuis affine morceau par morceau ; le "
+                                 "contrôle qualité ne garde qu'un garde-fou."))
+        self.style.currentIndexChanged.connect(self._refresh_dependent)
+        self.style.currentIndexChanged.connect(lambda _i: self._update_prompt_preview())
+        form.addRow(tr("Rendu"), self.style)
+        self.subject = QPlainTextEdit()
+        self.subject.setObjectName("prompt")
+        self.subject.setPlaceholderText(tr("Décris le résultat voulu plutôt qu'une consigne, en anglais de "
+                                           "préférence.\nEx. : green futuristic armor, scratched metal plates, worn "
+                                           "paint, gold reflective visor"))
+        self.subject.setToolTip(tr("Ajouté au prompt de chaque texture du lancement. Le modèle génère une image qui "
+                                   "correspond à une description :\n« rusty scratched metal » marche mieux que "
+                                   "« ajoute de la rouille ». SDXL comprend surtout l'anglais ;\nZ-Image comprend "
+                                   "aussi le français. Une règle par texture ([[rules]] hint) s'y ajoute."))
+        self.subject.setFixedHeight(self.subject.fontMetrics().lineSpacing() * 4 + 14)
+        self.subject.textChanged.connect(self._update_prompt_preview)
+        form.addRow(tr("Prompt à donner"), self.subject)
+        self.prompt_only = QCheckBox(tr("Prompt seul, sans ajouts"))
+        self.prompt_only.setToolTip(tr("Décoché : TEXFORGE l'entoure de son préfixe, du prompt du matériau détecté "
+                                       "(rendu Fidèle)\net de son suffixe. Coché : seul ton texte part, tu as la "
+                                       "main sur tout."))
+        self.prompt_only.toggled.connect(self._update_prompt_preview)
+        self.btn_enhance = QPushButton(tr("✨ Détailler en anglais…"))
+        self.btn_enhance.setToolTip(tr("Propose un prompt beaucoup plus détaillé, en anglais, à partir de ton texte : "
+                                       "aperçu modifiable avant de l'utiliser.\nModèle de langage local : Qwen3-4B "
+                                       "de Z-Image dans ComfyUI (nœud TextGenerate), sinon LM Studio ou Ollama.\n"
+                                       "Longueur adaptée au modèle : courte pour SDXL / SD 1.5, longue pour Z-Image."))
+        self.btn_enhance.clicked.connect(self.preview_enhanced_prompt)
+        self.subject.textChanged.connect(
+            lambda: self.btn_enhance.setEnabled(bool(self.subject.toPlainText().strip())))
+        self.btn_enhance.setEnabled(False)
+        prow = QHBoxLayout()
+        prow.setContentsMargins(0, 0, 0, 0)
+        prow.addWidget(self.prompt_only)
+        prow.addStretch(1)
+        prow.addWidget(self.btn_enhance)
+        form.addRow("", prow)
+        self.prompt_preview = QLabel()
+        self.prompt_preview.setObjectName("hint")
+        self.prompt_preview.setWordWrap(True)
+        self.prompt_preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        self.prompt_preview.setTextFormat(Qt.PlainText)
+        form.addRow("", self.prompt_preview)
+        self.denoise = ValueSlider(0.20, 1.00, 0.01, 0.42)
         self.denoise.setToolTip(tr("Part de l'image réinventée par le modèle. Bas : fidèle à l'original ;\n"
-                                   "haut : plus de matière et de détail, plus de risque de trahir la DA."))
+                                   "haut : plus de matière et de détail, plus de risque de trahir la DA.\n"
+                                   "Au-delà de 0,6 : rendu « Photoréaliste créatif » conseillé."))
+        self.auto_denoise = QCheckBox(tr("Denoise auto (maximum)"))
+        self.auto_denoise.setToolTip(tr("Fidèle : part de 0,60, le plus fort denoise qui garde d'ordinaire la texture "
+                                        "intacte, et redescend\n(0,49 puis 0,41) seulement si la validation voit la "
+                                        "texture transformée.\nPhotoréaliste créatif : part de 1,00 (puis 0,85 et "
+                                        "0,70 si le garde-fou échoue)."))
+        self._manual_denoise = 0.42
+        self.auto_denoise.toggled.connect(self._on_auto_denoise)
         self.cn = ValueSlider(0.30, 1.20, 0.05, 0.75)
         self.cn.setToolTip(tr("Force du ControlNet Tile : attache le rendu aux formes et aux couleurs de l'original."))
         self.denoise.valueChanged.connect(lambda _v: self._update_presets())
         self.cn.valueChanged.connect(lambda _v: self._update_presets())
         form.addRow("Denoise", self.denoise)
+        form.addRow("", self.auto_denoise)
         form.addRow("ControlNet Tile", self.cn)
         self.esrgan_detail = ValueSlider(0.0, 1.5, 0.05, 1.0)
         self.esrgan_detail.setToolTip(tr("Mode Real-ESRGAN : grain de matière ajouté là où le modèle a lissé.\n"
@@ -1005,6 +1214,12 @@ class MainWindow(QMainWindow):
         self.presets_label.setObjectName("hint")
         self.presets_label.setWordWrap(True)
         form.addRow("", self.presets_label)
+        self.style_warn = QLabel(tr("⚠ Au-delà de 0,6 en rendu Fidèle, le contrôle qualité rejettera la plupart des "
+                                    "résultats (version locale gardée) : choisis « Photoréaliste créatif »."))
+        self.style_warn.setWordWrap(True)
+        self.style_warn.setStyleSheet(f"color: {C['yellow']};")
+        self.style_warn.setVisible(False)
+        form.addRow("", self.style_warn)
         row = QHBoxLayout()
         self.scale = QComboBox()
         self.scale.addItem("×2", 2)
@@ -1083,6 +1298,14 @@ class MainWindow(QMainWindow):
             h.addWidget(widget)
             return w
 
+        self.force_ai = QCheckBox(tr("Tout passer par l'IA (ComfyUI)"))
+        self.force_ai.setToolTip(tr("Peau, visages, HUD, aplats et petites textures partent aussi vers ComfyUI.\n"
+                                    "Restent hors IA : normal maps et cartes de données (l'IA en ferait des données\n"
+                                    "fausses) et polices (lettres déformées)."))
+        self.tiled = QCheckBox(tr("IA par morceaux à la taille finale"))
+        self.tiled.setToolTip(tr("Le modèle travaille à environ 1 mégapixel. Coché : la texture est agrandie, puis\n"
+                                 "générée morceau par morceau à sa taille finale (vrai détail en 2048 / 4096).\n"
+                                 "Décoché : une seule passe à 1 mégapixel, puis agrandissement classique."))
         self.route_ui = QCheckBox(tr("Routage automatique HUD / UI"))
         self.route_ui.setToolTip(tr("Polices, icônes, HUD et cartes partent vers Real-ESRGAN / Waifu2x ; les matières\n"
                                     "vers ComfyUI. Décoché : tout ce qui n'est pas une donnée part vers ComfyUI."))
@@ -1104,11 +1327,18 @@ class MainWindow(QMainWindow):
         self.redo = QCheckBox(tr("Régénérer si les réglages ont changé"))
         self.redo.setToolTip(tr("Après un changement de modèle, de denoise ou de ControlNet, les textures déjà\n"
                                 "générées sont refaites. Les choix faits à la main dans la galerie sont conservés."))
-        for cb in (self.route_ui, self.seamless, self.mipmaps, self.qc, self.qc_fix, self.redo):
+        for cb in (self.route_ui, self.seamless, self.mipmaps, self.qc, self.qc_fix, self.redo, self.tiled):
             cb.setChecked(True)
         self.route_ui.toggled.connect(self._refresh_dependent)
+        self.force_ai.toggled.connect(self._refresh_dependent)
         self.seamless.toggled.connect(self._refresh_dependent)
         self.qc.toggled.connect(self._refresh_dependent)
+        lay.addWidget(self.force_ai)
+        lay.addWidget(hint(tr("Peau, visages et HUD compris. Restent hors IA : normal maps, cartes de données "
+                              "et polices.")))
+        lay.addWidget(self.tiled)
+        lay.addWidget(hint(tr("Vrai détail IA en 2048 / 4096 : 9 passages par texture en 2048, 25 en 4096 "
+                              "(plusieurs minutes par texture en 4096).")))
         lay.addWidget(self.route_ui)
         lay.addWidget(hint(tr("Upscale local rapide (Real-ESRGAN / Waifu2x), sans IA générative : "
                               "les textes restent lisibles.")))
@@ -1160,6 +1390,14 @@ class MainWindow(QMainWindow):
         info.addWidget(self.progress_detail, 1)
         info.addWidget(self.time_label)
         lay.addLayout(info)
+        self.eta_label = QLabel("")
+        self.eta_label.setObjectName("eta")
+        self.eta_label.setToolTip(tr("Durée du lancement entier (analyse, génération, contrôle qualité et export).\n"
+                                     "Calculée sur le nombre de passages ComfyUI et la taille des textures, puis "
+                                     "recalée sur le temps réellement mis par les textures déjà terminées.\n"
+                                     "Les durées mesurées sont mémorisées : l'estimation du lancement suivant sur ce "
+                                     "PC part d'elles."))
+        lay.addWidget(self.eta_label)
 
         chips = QHBoxLayout()
         chips.setSpacing(6)
@@ -1220,12 +1458,18 @@ class MainWindow(QMainWindow):
             input_dir=self.input_row.text(), output_dir=self.output_row.text(),
             target=self.target.currentData(), provider=self.provider.currentData(), server=self.server.text().strip(),
             model_family=self.family.currentData(), workflow=self.workflow_row.text(),
+            style=self.style.currentData(), subject=self.subject.toPlainText().strip(),
+            prompt_only=self.prompt_only.isChecked(),
+            auto_denoise=self.auto_denoise.isChecked(),
             workflow_edges=self.workflow_edges_row.text(),
             checkpoint="" if ckpt in ("", tr(NO_CKPT)) else ckpt, lora="" if lora in ("", tr(NO_LORA)) else lora,
-            lora_strength=self.lora_strength.value(), denoise=self.denoise.value(), cn_strength=self.cn.value(),
+            lora_strength=self.lora_strength.value(),
+            # denoise automatique : le curseur montre le maximum, la valeur choisie à la main reste enregistrée
+            denoise=self._manual_denoise if self.auto_denoise.isChecked() else self.denoise.value(), cn_strength=self.cn.value(),
             per_material=self.per_material.isChecked(), scale=self.scale.currentData(),
             max_side=self.max_side.currentData(), limit=self.limit.value(), redo_stale=self.redo.isChecked(),
-            route_ui=self.route_ui.isChecked(), seamless=self.seamless.isChecked(),
+            route_ui=self.route_ui.isChecked(), force_ai=self.force_ai.isChecked(), tiled=self.tiled.isChecked(),
+            seamless=self.seamless.isChecked(),
             force_seamless=self.force_seamless.isChecked() and self.seamless.isChecked(),
             mipmaps=self.mipmaps.isChecked(), qc=self.qc.isChecked(), qc_autofix=self.qc_fix.isChecked(),
             dds_format=self.dds_format.currentData(), encoder=self.encoder.currentData(),
@@ -1251,6 +1495,13 @@ class MainWindow(QMainWindow):
         select(self.provider, s.provider)
         self.server.setText(s.server)
         select(self.family, s.model_family)
+        select(self.style, s.style)
+        self.subject.setPlainText(s.subject)
+        self.prompt_only.setChecked(s.prompt_only)
+        self._manual_denoise = s.denoise
+        self.auto_denoise.blockSignals(True)
+        self.auto_denoise.setChecked(s.auto_denoise)
+        self.auto_denoise.blockSignals(False)
         self.workflow_row.setText(s.workflow)
         self.workflow_edges_row.setText(s.workflow_edges)
         text_combo(self.checkpoint, s.checkpoint, tr(NO_CKPT))
@@ -1264,6 +1515,8 @@ class MainWindow(QMainWindow):
         self.limit.setValue(s.limit)
         self.redo.setChecked(s.redo_stale)
         self.route_ui.setChecked(s.route_ui)
+        self.force_ai.setChecked(s.force_ai)
+        self.tiled.setChecked(s.tiled)
         self.seamless.setChecked(s.seamless)
         self.force_seamless.setChecked(s.force_seamless)
         self.mipmaps.setChecked(s.mipmaps)
@@ -1302,6 +1555,17 @@ class MainWindow(QMainWindow):
 
     def _refresh_project(self) -> None:
         self.project_label.setText(str(self._work_dir()) if self.input_row.text() else "—")
+        if hasattr(self, "compare"):
+            self.compare.set_project(self._work_dir() if self.input_row.text() else None)
+
+    def _toggle_compare(self, on: bool) -> None:
+        if not hasattr(self, "compare"):
+            return
+        self.compare.setVisible(on)
+        self.qs.setValue("compare_visible", on)
+        if on and sum(self.splitter.sizes()[:2]) and not self.splitter.sizes()[2]:
+            a, b, _c = self.splitter.sizes()
+            self.splitter.setSizes([a, max(420, b - 600), 600])   # panneau replié à la main : rouvert
 
     # ----------------------------------------------------------------- détection du dossier d'entrée
     def start_detection(self, auto_fill: bool = False) -> None:
@@ -1471,12 +1735,21 @@ class MainWindow(QMainWindow):
         comfy = self.provider.currentData() == "comfyui"
         esrgan = self.provider.currentData() == "esrgan"
         custom = self.family.currentData() == "custom"
-        for w in (self.family, self.checkpoint, self.lora):
-            w.setEnabled(comfy)
+        zimage = self.family.currentData() == "zimage"
+        self.family.setEnabled(comfy)
+        for w in (self.checkpoint, self.lora):          # Z-Image : modèle chargé en trois fichiers, sans LoRA ici
+            w.setEnabled(comfy and not zimage)
         for w in (self.server, self.btn_test):              # en mode Real-ESRGAN : savoir si ComfyUI est là
             w.setEnabled(comfy or esrgan)
-        for w in (self.denoise, self.cn, self.per_material):
-            w.setEnabled(not esrgan)
+        auto = self.auto_denoise.isChecked()
+        if auto:                                         # changement de rendu : maximum du nouveau rendu
+            top = AUTO_DENOISE.get(self.style.currentData(), (None,))[0]
+            if top is not None and abs(self.denoise.value() - top) > 1e-6:
+                self.denoise.setValue(top)
+        self.denoise.setEnabled(not esrgan and not auto)
+        self.auto_denoise.setEnabled(not esrgan)
+        self.per_material.setEnabled(not esrgan and self.style.currentData() != "photoreal")   # sans objet en photo
+        self.cn.setEnabled(not esrgan)
         self.esrgan_detail.setEnabled(esrgan)
         self._update_esrgan_status()
         if getattr(self, "chips", None) and self.worker is None:
@@ -1497,9 +1770,14 @@ class MainWindow(QMainWindow):
         self.bc7_warn.setVisible(dds and self.dds_format.currentData() == "bc7")
         self.force_seamless.setEnabled(self.seamless.isChecked())
         self.qc_fix.setEnabled(self.qc.isChecked())
-        self.realesrgan_row.setEnabled(self.route_ui.isChecked())
+        # Real-ESRGAN sert aussi à l'agrandissement local et à la base de l'IA par morceaux
+        self.realesrgan_row.setEnabled(True)
+        comfy_engine = self.provider.currentData() == "comfyui"
+        self.force_ai.setEnabled(comfy_engine)
+        self.tiled.setEnabled(comfy_engine)
         self._update_texconv_status()
         self._update_presets()
+        self._update_prompt_preview()
         self._refresh_project()
 
     def _esrgan_exe(self):
@@ -1568,6 +1846,22 @@ class MainWindow(QMainWindow):
             self.provider.setCurrentIndex(self.provider.findData("comfyui"))
             self.console.add(tr("[INFO] ComfyUI répond : moteur ComfyUI (remaster génératif)."))
 
+    def _auto_family(self, r: dict) -> None:
+        """Famille de modèle choisie d'après ce que ComfyUI contient, tant qu'elle n'a pas été choisie à la main :
+        sans checkpoint mais avec Z-Image Turbo -> Z-Image ; avec des checkpoints et une famille Z-Image
+        introuvable sur le serveur -> SDXL."""
+        if str(self.qs.value("family_chosen", "false")).lower() in ("true", "1") or self.worker is not None:
+            return
+        zimage = any("z_image" in u.lower() or "z-image" in u.lower() for u in r.get("unets", []))
+        cur = self.family.currentData()
+        if cur in ("sdxl", "sd15") and not r.get("checkpoints") and zimage:
+            self.family.setCurrentIndex(self.family.findData("zimage"))
+            self.console.add(tr("[INFO] ComfyUI n'a aucun checkpoint SDXL / SD 1.5 mais a Z-Image Turbo : famille "
+                                "Z-Image Turbo choisie."))
+        elif cur == "zimage" and r.get("checkpoints") and not zimage:
+            self.family.setCurrentIndex(self.family.findData("sdxl"))
+            self.console.add(tr("[INFO] Z-Image Turbo absent de ComfyUI : famille SDXL choisie."))
+
     def _update_texconv_status(self) -> None:
         from texforge.ddsbuild import find_texconv, is_texconv_name
         raw = self.texconv_row.text().strip()
@@ -1583,13 +1877,72 @@ class MainWindow(QMainWindow):
         else:
             self.texconv_status.setText(tr("texconv absent : l'encodeur intégré prendra le relais (DXT1/3/5)."))
 
-    def _update_presets(self) -> None:
+    def _update_prompt_preview(self, *_) -> None:
+        """Prompt réellement envoyé pour une texture sans matériau particulier, mis à jour à la frappe."""
+        if not hasattr(self, "prompt_preview"):
+            return
         s = self.collect()
+        c = {**DEFAULTS["comfyui"], **(PHOTOREAL if s.style == "photoreal" else {}), "style": s.style,
+             "subject": s.subject, "prompt_only": s.prompt_only}
+        text = compose_prompt(c, "", str(DEFAULTS["materials"]["generic"].get("prompt", "")), False)
+        self.prompt_preview.setText(tr("Prompt envoyé (texture générique) : {p}", p=text))
+
+    def preview_enhanced_prompt(self) -> None:
+        """Prompt détaillé en anglais, montré dans un aperçu ; remplace le texte seulement si on l'accepte."""
+        text = self.subject.toPlainText().strip()
+        if not text:
+            return
+        server = self.server.text().strip() if hasattr(self, "server") else ""
+        style, family = self.style.currentData(), self.family.currentData()
+        dlg = PromptPreviewDialog(self, text, None)
+
+        def generate(on_status, on_done) -> None:
+            bridge = _TextBridge()
+            bridge.line.connect(on_status)
+            dlg._bridge = bridge                          # gardé en vie pendant la tâche
+            self._run_task(lambda: enhance_prompt(text, server, style, family,
+                                                  on_status=lambda m: bridge.line.emit(m)), on_done)
+        dlg._generate = generate
+        QTimer.singleShot(0, dlg.run)
+        if dlg.exec() == QDialog.Accepted and dlg.prompt():
+            cur = self.subject.textCursor()               # remplacement annulable (Ctrl+Z)
+            cur.select(QTextCursor.Document)
+            cur.insertText(dlg.prompt())
+            self.console.add(tr("[PROMPT] prompt détaillé en anglais appliqué ({n} mots) — Ctrl+Z dans la zone pour "
+                                "revenir à ton texte", n=len(dlg.prompt().split())))
+
+    def _on_auto_denoise(self, on: bool) -> None:
+        if on:
+            self._manual_denoise = self.denoise.value()
+        else:
+            self.denoise.setValue(self._manual_denoise)   # retour à la valeur choisie à la main
+        self._refresh_dependent()
+
+    def _update_presets(self) -> None:
+        s = effective(self.collect())
+        self.style_warn.setVisible(s.style == "faithful" and s.denoise > 0.6 and s.provider == "comfyui")
+        ladder = ""
+        if s.auto_denoise and s.style in AUTO_DENOISE:
+            top, steps = AUTO_DENOISE[s.style]
+            ladder = " " + tr("(si refus : {steps})", steps=", ".join(f"{top * f:.2f}" for f in steps[1:]))
+        if s.style == "photoreal":
+            refine = min(0.45, max(0.25, s.denoise * 0.5))
+            self.presets_label.setText(tr("passe globale : denoise {d:.2f} sur l'image entière, puis affinage par "
+                                          "morceaux à {r:.2f} ; ControlNet Tile {c:.2f}", d=s.denoise, r=refine,
+                                          c=s.cn_strength) + ladder)
+            return
         p = material_presets(s)
         names = (("stone", N_("pierre")), ("masonry", N_("maçonnerie")), ("metal", N_("métal")), ("wood", N_("bois")),
                  ("fabric", N_("tissu")), ("vegetation", N_("végétation")), ("skin", N_("peau")))
+        if s.model_family in DENOISE_SCALE:
+            with_cn, without = DENOISE_SCALE[s.model_family]
+            txt = " · ".join(f"{tr(nm)} {min(0.9, p[k]['denoise'] * with_cn):.2f}/{p[k]['cn_strength']:.2f}"
+                             for k, nm in names if k in p)
+            self.presets_label.setText(tr("denoise / ControlNet Tile effectifs : {txt} — sans le fichier du ControlNet "
+                                          "Tile : denoise ×{f}", txt=txt, f=f"{without:.2f}") + ladder)
+            return
         txt = " · ".join(f"{tr(nm)} {p[k]['denoise']:.2f}/{p[k]['cn_strength']:.2f}" for k, nm in names if k in p)
-        self.presets_label.setText(tr("denoise / ControlNet effectifs : {txt}", txt=txt))
+        self.presets_label.setText(tr("denoise / ControlNet effectifs : {txt}", txt=txt) + ladder)
 
     # ----------------------------------------------------------------- serveur ComfyUI
     def _run_task(self, fn, cb, *args) -> None:
@@ -1630,6 +1983,7 @@ class MainWindow(QMainWindow):
             vram = tr(", {gb:.1f} Go libres", gb=free / 2 ** 30) if free else ""
             self._set_pill(f"● ComfyUI {r.get('version', '')} — {r.get('gpu', '?')}{vram}", "ok")
             self.server_pill.setToolTip("")
+            self._auto_family(r)
             for combo, items, empty in ((self.checkpoint, r.get("checkpoints", []), tr(NO_CKPT)),
                                         (self.lora, r.get("loras", []), tr(NO_LORA))):
                 if not items:
@@ -1667,10 +2021,19 @@ class MainWindow(QMainWindow):
             return
         # dossier sans aucune texture lisible (installation d'un jeu aux textures empaquetées…) :
         # le traitement ne produirait rien, on explique tout de suite quoi faire
-        chk = check_input(s.input_dir, max_entries=20_000)
+        chk = check_input(s.input_dir, max_entries=20_000, stop_at_image=False)
         if chk.images == 0 and chk.complete:
             QMessageBox.warning(self, APP_NAME, empty_input_help(s.input_dir, chk))
             return
+        if chk.exe and chk.complete and chk.images < FEW_IMAGES:
+            # dossier d'installation avec quelques icônes : ce ne sont pas les textures du jeu
+            ans = QMessageBox.question(
+                self, APP_NAME, tr("Ce dossier de jeu ne contient que {n} image(s) séparée(s) : sans doute des icônes "
+                                   "ou des fichiers annexes, pas les textures du jeu.", n=chk.images)
+                + "\n\n" + empty_input_help(s.input_dir, chk) + "\n\n" + tr("Lancer quand même ?"),
+                QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+            if ans != QMessageBox.Yes:
+                return
         if s.target == "specialk" and not self._is_inject_dir(s.output_dir):
             sugg = inject_for(s.input_dir)
             ok = QMessageBox.question(
@@ -1764,6 +2127,8 @@ class MainWindow(QMainWindow):
         self.progress.setValue(0)
         self.progress.setFormat(tr("Démarrage…"))
         self.progress_detail.setText("—")
+        self._eta_end = self._eta_first = None
+        self.eta_label.setText(tr("Durée totale estimée : calculée à la fin de l'analyse des textures"))
         self.console.add(tr("══ Lancement — {src} → {dst}", src=s.input_dir, dst=s.output_dir))
         self._set_running(True)
         self.t_start = time.monotonic()
@@ -1811,6 +2176,8 @@ class MainWindow(QMainWindow):
         for b in (self.btn_report, self.btn_gallery):
             b.setEnabled(not running)
         self.lang_combo.setEnabled(not running)          # la langue se change entre deux traitements
+        if hasattr(self, "update_info"):
+            self._paint_update()                          # pas de mise à jour pendant un traitement
         self.stop_phase = 0
         if running:
             self.btn_launch.setText(tr("■  ANNULER"))
@@ -1839,6 +2206,8 @@ class MainWindow(QMainWindow):
             if ev.get("status") in ("ok", "errors"):
                 for st in STAGES:
                     self._stage_state(st, "done")
+        if e in ("comfy_done", "local_done", "ui_done", "esrgan_done", "fallback", "qc_done", "pipeline_end"):
+            self.compare.schedule_refresh(follow=e != "pipeline_end")
         self._count(e, ev)
         text = format_event(ev)
         if text:
@@ -1863,6 +2232,13 @@ class MainWindow(QMainWindow):
         eta = ev.get("eta_s")
         self.progress_detail.setText(tr("{label} : {done}/{total}", label=label, done=done, total=total)
                                      + (tr(" — reste ~{t} pour cette étape", t=fmt_duration(eta)) if eta else ""))
+        rest = ev.get("eta_total_s")
+        if rest is not None and self.worker is not None:
+            now = time.monotonic()
+            self._eta_end = now + float(rest)
+            if self._eta_first is None:
+                self._eta_first = now - self.t_start + float(rest)
+            self._paint_eta()
 
     @Slot(str)
     def _on_stderr(self, line: str) -> None:
@@ -1874,6 +2250,10 @@ class MainWindow(QMainWindow):
     def _on_finished(self, code: int) -> None:
         self.clock.stop()
         elapsed = fmt_duration(time.monotonic() - self.t_start)
+        self._eta_end = None
+        finished = code in (EXIT_OK, EXIT_ERRORS) and self._eta_first is not None   # arrêt : rien à comparer
+        self.eta_label.setText(tr("Durée réelle {real} — estimation de départ ~{first}", real=elapsed,
+                                  first=fmt_estimate(self._eta_first)) if finished else "")
         status = {EXIT_OK: (tr("Pipeline terminé"), "ok"),
                   EXIT_ERRORS: (tr("Terminé avec des échecs (voir la console)"), "warn"),
                   EXIT_STOPPED: (tr("Arrêté — relancer reprend où l'on s'est arrêté"), "stop"),
@@ -1897,6 +2277,19 @@ class MainWindow(QMainWindow):
 
     def _tick(self) -> None:
         self.time_label.setText(f"⏱ {fmt_duration(time.monotonic() - self.t_start)}")
+        self._paint_eta()
+
+    def _paint_eta(self) -> None:
+        """Durée totale estimée, temps restant (décompté chaque seconde entre deux recalages) et heure de fin."""
+        if self._eta_end is None:
+            return
+        now = time.monotonic()
+        rest = max(0.0, self._eta_end - now)
+        total = now - self.t_start + rest
+        end = time.time() + rest
+        when = time.strftime("%H:%M" if rest < 20 * 3600 else "%d/%m %H:%M", time.localtime(end))
+        self.eta_label.setText(tr("Durée totale estimée ~{total} · reste ~{rest} · fin vers {when}",
+                                  total=fmt_estimate(total), rest=fmt_estimate(rest), when=when))
 
     # ----------------------------------------------------------------- affichage
     def _stage_state(self, stage: str, state: str) -> None:
@@ -1978,6 +2371,213 @@ class MainWindow(QMainWindow):
         QTimer.singleShot(0, lambda: switch_language(self, code))
 
     # ----------------------------------------------------------------- fermeture
+    # ----------------------------------------------------------------- mises à jour (dépôt GitHub)
+    def _auto_check_update(self) -> None:
+        if str(self.qs.value("update_auto", "true")).lower() in ("true", "1"):
+            self.check_updates(manual=False)
+
+    def check_updates(self, manual: bool = False) -> None:
+        if self._update_checking or self._updating:
+            return
+        self._update_checking = True
+        self._paint_update()
+        self._run_task(updater.check, lambda r: self._on_update_checked(r, manual))
+
+    def _on_update_checked(self, r: dict, manual: bool) -> None:
+        self._update_checking = False
+        if "local" not in r:                              # exception dans la tâche
+            r = {"error": tr("vérification impossible : {why}", why=r.get("error", "?")), "local": __version__,
+                 "running": __version__}
+        self.update_info = r
+        self._update_checked_at = time.time()
+        _ACTIVE["update"] = (self._update_checked_at, dict(r))
+        self._paint_update()
+        if r.get("available") and not r.get("restart"):
+            if manual or self.qs.value("update_announced", "") != r.get("remote"):
+                self.console.add(tr("[MAJ] TEXFORGE {remote} disponible sur GitHub (installée : {local}) — bouton "
+                                    "« Mettre à jour » en haut à droite.", remote=r["remote"], local=r["local"])
+                                 + (f" {r['message']}" if r.get("message") else ""))
+                self.qs.setValue("update_announced", r.get("remote"))
+        elif manual:
+            if r.get("error"):
+                self.console.add(f"[MAJ] {r['error']}")
+            elif r.get("newer_local"):
+                self.console.add(tr("[MAJ] TEXFORGE {local} : plus récente que la version du dépôt GitHub ({remote}), "
+                                    "rien à installer.", local=r["local"], remote=r["remote"]))
+            else:
+                self.console.add(tr("[MAJ] TEXFORGE {local} est à jour (dépôt GitHub : {remote}).",
+                                    local=r["local"], remote=r["remote"]))
+
+    def _paint_update(self) -> None:
+        """Pastille (gris : rien à installer, vert : mise à jour disponible ou installée) et bouton."""
+        r = self.update_info or {}
+        busy = self.worker is not None or self.launching or self._installing
+        state, btn = "none", ""
+        text = f"● v{__version__}"
+        if self._updating:
+            state, text = "available", tr("● installation…")
+            tip = tr("Installation de TEXFORGE {remote} en cours…", remote=r.get("remote", "?"))
+        elif r.get("restart"):
+            state, btn = "restart", tr("↻ Redémarrer")
+            text = tr("● {v} installée", v=r.get("local", "?"))
+            tip = tr("TEXFORGE {v} est installée sur le disque ; la version {running} tourne encore.\n"
+                     "Redémarre l'application pour l'utiliser.", v=r.get("local", "?"), running=__version__)
+        elif r.get("available"):
+            state = "available"
+            text = tr("● {v} disponible", v=r["remote"])
+            when = (r.get("date") or "")[:10]
+            tip = tr("TEXFORGE {remote} disponible sur GitHub ({repo}) — installée : {local}", remote=r["remote"],
+                     repo=r.get("repo", ""), local=r.get("local", "?"))
+            if r.get("message"):
+                tip += "\n" + tr("Dernier changement : {msg}", msg=r["message"]) + (f" ({when})" if when else "")
+            if r.get("git"):
+                tip += "\n" + tr("Installation suivie par git : mets-la à jour avec « git pull ».")
+            else:
+                btn = tr("⬇ Mettre à jour")
+        elif self._update_checking:
+            tip = tr("Recherche d'une mise à jour sur GitHub…")
+        elif r.get("error"):
+            tip = tr("{err}\nNouvel essai automatique dans 2 min ; clic sur la pastille pour réessayer.", err=r["error"])
+        elif r.get("newer_local"):
+            tip = tr("TEXFORGE {local} : plus récente que la version du dépôt GitHub ({remote}).\nRien à installer ; "
+                     "publie-la sur GitHub pour que les autres installations la reçoivent.", local=r.get("local"),
+                     remote=r.get("remote"))
+        elif r.get("remote"):
+            tip = tr("TEXFORGE {local} est à jour (dépôt GitHub {repo}).", local=r.get("local"), repo=r.get("repo", ""))
+        else:
+            tip = tr("Mises à jour : vérification au démarrage…")
+        if self._update_checked_at and not self._updating:
+            tip += "\n" + tr("Dernière vérification : {t}", t=time.strftime("%H:%M", time.localtime(self._update_checked_at)))
+        self.update_pill.setText(text)
+        self.update_pill.setProperty("state", state)
+        self.update_pill.setToolTip(tip + "\n" + tr("Clic : vérifier maintenant, dépôt GitHub, retour arrière."))
+        repolish(self.update_pill)
+        self.update_btn.setVisible(bool(btn))
+        self.update_btn.setText(btn or tr("⬇ Mettre à jour"))
+        self.update_btn.setEnabled(not busy and not self._updating)
+        self.update_btn.setToolTip(tr("Possible après le traitement en cours.") if busy else tip)
+
+    def _update_menu(self) -> None:
+        menu = QMenu(self)
+        a = menu.addAction(tr("Vérifier maintenant"))
+        a.setEnabled(not self._update_checking and not self._updating)
+        a.triggered.connect(lambda: self.check_updates(manual=True))
+        menu.addAction(tr("Ouvrir le dépôt sur GitHub ({repo})", repo=updater.repo()),
+                       lambda: QDesktopServices.openUrl(QUrl(updater.repo_url() + "/commits")))
+        menu.addSeparator()
+        auto = menu.addAction(tr("Vérifier automatiquement (démarrage, puis toutes les 2 min)"))
+        auto.setCheckable(True)
+        auto.setChecked(str(self.qs.value("update_auto", "true")).lower() in ("true", "1"))
+        auto.toggled.connect(lambda on: self.qs.setValue("update_auto", bool(on)))
+        back = updater.last_backup()
+        if back is not None:
+            menu.addSeparator()
+            b = menu.addAction(tr("Revenir à la version {v} (avant la dernière mise à jour)", v=back.get("from", "?")))
+            b.setEnabled(self.worker is None and not self._updating)
+            b.triggered.connect(self._rollback_update)
+        menu.exec(self.update_pill.mapToGlobal(self.update_pill.rect().bottomLeft()))
+
+    def _on_update_clicked(self) -> None:
+        r = self.update_info or {}
+        if r.get("restart"):
+            self._restart_app()
+            return
+        if not r.get("available") or self._updating or self.worker is not None:
+            return
+        msg = tr("Installer TEXFORGE {remote} depuis GitHub ({repo}) ?\n\nVersion installée : {local}.",
+                 remote=r["remote"], repo=r.get("repo", ""), local=r.get("local", "?"))
+        if r.get("message"):
+            msg += "\n" + tr("Dernier changement : {msg}", msg=r["message"])
+        msg += "\n\n" + tr("La nouvelle version est téléchargée puis contrôlée avant toute écriture ; les fichiers "
+                            "remplacés sont sauvegardés (retour arrière possible depuis la pastille). L'application "
+                            "redémarre ensuite.")
+        if QMessageBox.question(self, APP_NAME, msg) != QMessageBox.Yes:
+            return
+        self._install_update(dict(r))
+
+    def _install_update(self, info: dict) -> None:
+        self._updating = True
+        self.btn_launch.setEnabled(False)
+        self._paint_update()
+        prog, text = _ProgressBridge(), _TextBridge()
+        prog.step.connect(lambda done, total: self.update_pill.setText(
+            tr("● téléchargement {pct} %", pct=int(done * 100 / total)) if total
+            else tr("● téléchargement {mb:.1f} Mo", mb=done / 2 ** 20)))
+        text.line.connect(self.console.add)
+        self._update_bridges = (prog, text)              # gardés en vie pendant la tâche
+
+        def work():
+            return updater.apply(info, lambda d, t: prog.step.emit(d, t), lambda m: text.line.emit(m))
+
+        def done(res: dict) -> None:
+            self._updating = False
+            self.btn_launch.setEnabled(True)
+            if "error" in res:
+                err = re.sub(r"^\w*Error: ", "", str(res["error"]))
+                self.console.add(tr("[MAJ] ✗ mise à jour impossible : {err}", err=err))
+                self._paint_update()
+                QMessageBox.warning(self, APP_NAME, tr("Mise à jour impossible :\n\n{err}", err=err))
+                return
+            self.update_info = {**self.update_info, "local": res["to"], "restart": True, "available": False}
+            _ACTIVE["update"] = (time.time(), dict(self.update_info))
+            self._paint_update()
+            self.console.add(tr("[MAJ] TEXFORGE {to} installée ({n} fichier(s) remplacé(s), {a} ajouté(s)) — "
+                                "redémarre l'application pour l'utiliser.", to=res["to"], n=res["replaced"],
+                                a=res["added"]))
+            if QMessageBox.question(self, APP_NAME, tr("TEXFORGE {to} est installée.\n\nRedémarrer maintenant ?",
+                                                       to=res["to"])) == QMessageBox.Yes:
+                self._restart_app()
+        self._run_task(work, done)
+
+    def _rollback_update(self) -> None:
+        back = updater.last_backup()
+        if back is None or self.worker is not None:
+            return
+        if QMessageBox.question(self, APP_NAME, tr("Revenir à TEXFORGE {v} ?\n\nLes fichiers d'avant la dernière "
+                                                   "mise à jour ({to}) sont remis en place, puis l'application "
+                                                   "redémarre.", v=back.get("from", "?"),
+                                                   to=back.get("to", "?"))) != QMessageBox.Yes:
+            return
+
+        def done(res: dict) -> None:
+            if "error" in res:
+                err = re.sub(r"^\w*Error: ", "", str(res["error"]))
+                self.console.add(tr("[MAJ] ✗ retour arrière impossible : {err}", err=err))
+                QMessageBox.warning(self, APP_NAME, tr("Retour arrière impossible :\n\n{err}", err=err))
+                return
+            self.console.add(tr("[MAJ] Retour à TEXFORGE {to} : {n} fichier(s) restauré(s), {a} retiré(s).",
+                                to=res["to"], n=res["restored"], a=res["removed"]))
+            self.update_info = {**self.update_info, "local": res["to"], "restart": res["to"] != __version__,
+                                "available": False}
+            _ACTIVE.pop("update", None)
+            self._paint_update()
+            if res["to"] == __version__:
+                self.check_updates()                       # la version du dépôt redevient proposée
+            elif QMessageBox.question(
+                    self, APP_NAME, tr("TEXFORGE {to} est remise en place.\n\nRedémarrer maintenant ?",
+                                       to=res["to"])) == QMessageBox.Yes:
+                self._restart_app()
+        self._run_task(updater.rollback, done)
+
+    def _restart_app(self) -> None:
+        """Relance l'interface dans un nouveau processus (modules rechargés), puis ferme celle-ci."""
+        if self.worker is not None:
+            QMessageBox.information(self, APP_NAME, tr("Redémarrage possible après le traitement en cours."))
+            return
+        cmd = updater.restart_command()
+        try:
+            if os.name == "nt":
+                flags = getattr(subprocess, "DETACHED_PROCESS", 0) | getattr(subprocess, "CREATE_NEW_PROCESS_GROUP", 0)
+                subprocess.Popen(cmd, cwd=str(updater.install_root()), close_fds=True, creationflags=flags)
+            else:
+                subprocess.Popen(cmd, cwd=str(updater.install_root()), close_fds=True, start_new_session=True)
+        except OSError as exc:
+            QMessageBox.warning(self, APP_NAME, tr("Redémarrage impossible : {err}\nRelance TEXFORGE à la main.",
+                                                   err=exc))
+            return
+        self.close()
+        QApplication.quit()
+
     def closeEvent(self, event) -> None:
         if self.worker is not None:
             if QMessageBox.question(self, APP_NAME, tr("Un traitement est en cours. L'arrêter et quitter ?\n\n"

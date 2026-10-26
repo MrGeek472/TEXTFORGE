@@ -1149,8 +1149,8 @@ MESSAGES: dict[str, str] = {
         'Check now',
     'Ouvrir le dépôt sur GitHub ({repo})':
         'Open the repository on GitHub ({repo})',
-    'Vérifier automatiquement (démarrage, puis toutes les 30 min)':
-        'Check automatically (at startup, then every 30 min)',
+    'Vérifier automatiquement (démarrage, puis toutes les 2 min)':
+        'Check automatically (at startup, then every 2 min)',
     "La nouvelle version est téléchargée puis contrôlée avant toute écriture ; les fichiers remplacés sont sauvegardés (retour arrière possible depuis la pastille). L'application redémarre ensuite.":
         'The new version is downloaded and checked before anything is written; replaced files are backed up (roll back from the badge). The application then restarts.',
     'vérification impossible : {why}':
@@ -1213,8 +1213,8 @@ MESSAGES: dict[str, str] = {
         '[UPDATE] TEXFORGE {local} is up to date (GitHub repository: {remote}).',
     'Installation suivie par git : mets-la à jour avec « git pull ».':
         'Install tracked by git: update it with "git pull".',
-    '{err}\nNouvel essai automatique dans 30 min ; clic sur la pastille pour réessayer.':
-        '{err}\nAutomatic retry in 30 min; click the badge to try again.',
+    '{err}\nNouvel essai automatique dans 2 min ; clic sur la pastille pour réessayer.':
+        '{err}\nAutomatic retry in 2 min; click the badge to try again.',
     'TEXFORGE {local} : plus récente que la version du dépôt GitHub ({remote}).\nRien à installer ; publie-la sur GitHub pour que les autres installations la reçoivent.':
         'TEXFORGE {local}: newer than the GitHub repository version ({remote}).\nNothing to install; publish it on GitHub so other installs receive it.',
     'TEXFORGE {local} est à jour (dépôt GitHub {repo}).':
@@ -1297,4 +1297,56 @@ MESSAGES: dict[str, str] = {
         'imported by {file}',
     'écriture impossible ({err}) et restauration incomplète ({err2}) : sauvegarde dans {path}':
         'write failed ({err}) and incomplete restore ({err2}): backup in {path}',
+    'Prompt détaillé en anglais — aperçu':
+        'Detailed English prompt — preview',
+    'Ton texte :':
+        'Your text:',
+    '↻ Régénérer':
+        '↻ Regenerate',
+    'Utiliser ce prompt':
+        'Use this prompt',
+    'Génération en cours…':
+        'Generating…',
+    '✨ Détailler en anglais…':
+        '✨ Detail in English…',
+    "Propose un prompt beaucoup plus détaillé, en anglais, à partir de ton texte : aperçu modifiable avant de l'utiliser.\nModèle de langage local : Qwen3-4B de Z-Image dans ComfyUI (nœud TextGenerate), sinon LM Studio ou Ollama.\nLongueur adaptée au modèle : courte pour SDXL / SD 1.5, longue pour Z-Image.":
+        "Suggests a much more detailed English prompt from your text: editable preview before you use it.\nLocal language model: Z-Image's Qwen3-4B in ComfyUI (TextGenerate node), otherwise LM Studio or Ollama.\nLength fitted to the model: short for SDXL / SD 1.5, long for Z-Image.",
+    "Prompt proposé (modifiable avant de l'utiliser) :":
+        'Suggested prompt (editable before use):',
+    '{engine} · {words} mots · {s} s':
+        '{engine} · {words} words · {s} s',
+    '[PROMPT] prompt détaillé en anglais appliqué ({n} mots) — Ctrl+Z dans la zone pour revenir à ton texte':
+        '[PROMPT] detailed English prompt applied ({n} words) — Ctrl+Z in the box to get your text back',
+    '{model} dans ComfyUI : génération du prompt (le premier appel charge le modèle)…':
+        '{model} in ComfyUI: generating the prompt (the first call loads the model)…',
+    'pas de réponse de ComfyUI en {s} s':
+        'no answer from ComfyUI within {s} s',
+    '{name} ({model}) : génération du prompt…':
+        '{name} ({model}): generating the prompt…',
+    "aucun modèle de langage disponible pour détailler le prompt :\n- {why}\n\nIl faut soit ComfyUI à jour avec l'encodeur Qwen3-4B de Z-Image Turbo (qwen_3_4b.safetensors), soit LM Studio ou Ollama lancés avec un modèle.":
+        "no language model available to detail the prompt:\n- {why}\n\nYou need either an up-to-date ComfyUI with Z-Image Turbo's Qwen3-4B text encoder (qwen_3_4b.safetensors), or LM Studio or Ollama running with a model.",
+    'ComfyUI sans le nœud TextGenerate (version trop ancienne : mets ComfyUI à jour)':
+        'ComfyUI without the TextGenerate node (version too old: update ComfyUI)',
+    'aucun encodeur de texte Qwen dans ComfyUI (models\\text_encoders) ; celui de Z-Image Turbo, qwen_3_4b.safetensors, convient':
+        "no Qwen text encoder in ComfyUI (models\\text_encoders); Z-Image Turbo's, qwen_3_4b.safetensors, works",
+    'ComfyUI a refusé la demande : {err}':
+        'ComfyUI refused the request: {err}',
+    '{name} sans modèle':
+        '{name} has no model',
+    "écris d'abord quelques mots dans « Prompt à donner »":
+        'write a few words in "Prompt to give" first',
+    'ComfyUI injoignable ({err})':
+        'ComfyUI unreachable ({err})',
+    '{name} non lancé':
+        '{name} not running',
+    '{name} : échec ({err})':
+        '{name}: failed ({err})',
+    '{engine} : réponse vide':
+        '{engine}: empty answer',
+    'échec dans ComfyUI : {err}':
+        'failure in ComfyUI: {err}',
+    '{model} (ComfyUI)':
+        '{model} (ComfyUI)',
+    "envoi incomplet sur GitHub : {n} fichier(s) de la version {v} absent(s) ou ancien(s) dans le dépôt ({files}) — rien n'a été modifié. Envoie tout le contenu du zip de la version, dossiers compris.":
+        "incomplete upload to GitHub: {n} file(s) of version {v} missing or outdated in the repository ({files}) — nothing was changed. Upload the whole content of the version's zip, folders included.",
 }

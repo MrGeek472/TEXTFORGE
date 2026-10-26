@@ -1,22 +1,3 @@
-Original
-<img width="255" height="255" alt="Original" src="https://github.com/user-attachments/assets/b5d16c01-8213-4415-9aa1-95cb043a0df8" />
-Fait par IA
-<img width="255" height="255" alt="IA" src="https://github.com/user-attachments/assets/40546b1d-5650-49d6-9266-c8e3ee064905" />
-
-
-
-
-
-
-
-
-
-
-
-
-
-
-
 # TEXFORGE
 
 Remaster IA des textures de jeux PC anciens (DirectX 9 et antérieurs), en traitement
@@ -55,8 +36,19 @@ en ligne avec anti-triche, les jeux DX11/DX12.
    `texforge.bat install-realesrgan` (ou le bouton de l'interface) télécharge `realesrgan-ncnn-vulkan`
    (45 Mo, version officielle, empreinte SHA-256 vérifiée) dans `tools\realesrgan-ncnn-vulkan\`.
    **Avec ComfyUI** (remaster génératif) : installé et lancé (voir le guide « Workflows ComfyUI pour TEXFORGE ») avec :
-   - un checkpoint SDXL (ou SD 1.5) et le ControlNet Tile correspondant ;
-   - les nœuds `ComfyUI-seamless-tiling` (raccord des textures répétables) ;
+   - un checkpoint SDXL (ou SD 1.5) et le ControlNet Tile correspondant, **ou** Z-Image Turbo
+     (`z_image_turbo_bf16.safetensors` dans `diffusion_models`, `qwen_3_4b.safetensors` dans
+     `text_encoders`, `ae.safetensors` dans `vae`, huggingface.co/Comfy-Org/z_image_turbo) : famille
+     « Z-Image Turbo », choisie seule par l'interface quand ComfyUI n'a aucun checkpoint mais a Z-Image ;
+   - avant la première texture, TEXFORGE compare les modèles du workflow à ceux de ComfyUI : un modèle
+     par défaut absent est remplacé par un équivalent présent (autre checkpoint SDXL, autre ControlNet
+     Tile SDXL, autre précision du même modèle), le workflow Tile+Canny est désactivé si son ControlNet
+     Union manque, sinon le lancement s'arrête tout de suite en disant quel fichier manque, dans quel
+     dossier `models\…` et où le trouver ;
+   - les nœuds `ComfyUI-seamless-tiling` (raccord des textures répétables), **facultatifs** : s'ils
+     manquent, TEXFORGE les retire du workflow et prolonge lui-même les bords en boucle avant l'envoi
+     (même chose pour `ColorTransfer` : les couleurs sont recalées après coup). Un nœud indispensable
+     absent (ControlNet, KSampler…) arrête le lancement tout de suite, avec la liste ;
    - lancement conseillé : `python main.py --listen 127.0.0.1 --port 8188`.
 5. **Moteur UI rapide** : télécharge `realesrgan-ncnn-vulkan` (et facultativement
    `waifu2x-ncnn-vulkan`) depuis leurs pages GitHub officielles, décompresse-les, puis renseigne
@@ -83,9 +75,149 @@ qualité, DDS avec mipmaps dans le dossier de sortie.
 | Modèle / checkpoint | moteur (ComfyUI ou simulation sans GPU), serveur + « Tester », famille SDXL / SD 1.5 / workflow personnalisé, checkpoint et LoRA lus sur le serveur, force de la LoRA |
 | Photoréalisme / DA | denoise (0,20–0,60) et ControlNet Tile, « ajuster par matériau » (décale les préréglages au lieu de les remplacer, valeurs effectives affichées), ×2/×4, côté maximal, lot d'essai |
 | DDS | cible (DDS Special K ou PNG RTX Remix), format (identique à l'original, auto BC1/BC3, BC1, BC3, BC7 Direct3D 11, BGRA8), encodeur, chemin de texconv |
-| Options | routage HUD/UI, seamless tiling (+ forcer, déconseillé), mipmaps, QC SSIM/DA (+ correctifs), régénération après changement de réglages |
+| Options | tout par l'IA, IA par morceaux à la taille finale, routage HUD/UI, seamless tiling (+ forcer, déconseillé), mipmaps, QC SSIM/DA (+ correctifs), régénération après changement de réglages |
 | Suivi | barre de progression réelle (scan 10 %, génération 60 %, QC et export 30 %), étape en cours, temps restant de l'étape, compteurs, console colorée filtrable et enregistrable |
 | Résultats | dossier de sortie, rapport QC (tableau filtrable), galerie avant / après |
+| Avant / Après (à droite) | original à gauche, résultat à droite (IA, essai IA écarté au QC ou agrandissement sans IA, en couleur), zoom à la molette et déplacement synchronisés, « Ajuster » / « 1:1 », « Suivre » pendant un lancement, filtre « IA seulement » ; bouton ◧ de l'en-tête pour le masquer |
+| Mise à jour (coin haut droit) | pastille grise : rien à installer ; verte : version plus récente sur GitHub, bouton « Mettre à jour » (voir « Mises à jour ») |
+
+### Mises à jour depuis GitHub
+
+Au démarrage puis toutes les 2 minutes, TEXFORGE lit la version du dernier commit du dépôt
+[MrGeek472/TEXTFORGE](https://github.com/MrGeek472/TEXTFORGE) (`__version__` de
+`texforge/__init__.py`) et la compare à celle installée.
+- **Pastille grise** (`● v0.5.4`) : rien à installer. Cas inclus : dépôt injoignable (l'infobulle
+  donne la raison) et version installée plus récente que celle du dépôt (pas encore publiée).
+- **Pastille verte** (`● 0.5.5 disponible`) + bouton **⬇ Mettre à jour** : l'infobulle donne le
+  dernier message de commit. Le bouton télécharge l'archive de ce commit précis et la contrôle
+  **avant d'écrire quoi que ce soit** :
+  1. chemins sûrs ;
+  2. version attendue ;
+  3. compilation de chaque fichier Python ;
+  4. présence de tous les modules du projet importés (un dépôt où il manque un fichier est refusé) ;
+  5. installation des dépendances avec pip si `requirements.txt` a changé ;
+  6. import d'essai de la nouvelle version dans un processus à part.
+
+  Ensuite seulement, les fichiers qui diffèrent sont remplacés, après copie des originaux dans
+  `%LOCALAPPDATA%\TEXFORGE\mises_a_jour\sauvegarde-…` (3 dernières gardées). Une erreur
+  d'écriture remet tout en place. L'application propose ensuite de redémarrer (bouton
+  **↻ Redémarrer** si tu refuses). Bouton grisé pendant un traitement.
+- **Clic sur la pastille** : vérifier maintenant, ouvrir le dépôt, couper la vérification
+  automatique, **revenir à la version précédente** (fichiers sauvegardés remis en place).
+- **Pas de suppression** : les fichiers locaux absents du dépôt ne sont jamais supprimés.
+- **Installation suivie par git** (dossier `.git`) : rien n'est écrasé, mets-la à jour avec
+  `git pull`.
+- **Pour publier une version** : envoie sur GitHub **tous** les fichiers de la version (dossiers
+  compris), avec `__version__` augmenté. Sans augmentation de version, rien n'est proposé.
+- **Envoi partiel refusé** : `texforge/release.json` liste l'empreinte de chaque fichier de la version.
+  Si le dépôt mélange une version neuve et des fichiers anciens (seul `texforge/` envoyé, par
+  exemple), la mise à jour est refusée avant toute écriture, avec la liste des fichiers à renvoyer.
+  Le README et la licence ne sont pas contrôlés : tu peux les adapter sur GitHub.
+- **Vérifications fréquentes** : requête conditionnelle à l'API GitHub (réponse « rien de changé »
+  quand le dépôt n'a pas bougé). Si GitHub limite les requêtes, la version est lue directement sur
+  la branche par défaut jusqu'à la levée de la limite.
+- **En ligne de commande** : `texforge.bat update --check`, `texforge.bat update`,
+  `texforge.bat update --rollback`.
+
+### Tout par l'IA, et IA par morceaux
+
+**Tout passer par l'IA (ComfyUI)** envoie aussi à ComfyUI la peau et les visages, le HUD, les
+aplats, les dégradés, les petites textures et les formats allongés. Trois catégories restent hors
+IA : les normal maps et cartes de données (l'IA produirait des vecteurs ou des masques faux, donc
+un éclairage cassé en jeu), les polices (lettres déformées) et les textures de moins de 8 px.
+
+**Rendu photoréaliste créatif** (menu « Rendu ») : pour inventer beaucoup de détail, jusqu'à
+réinventer la matière (denoise jusqu'à 1). Trois différences avec le rendu Fidèle :
+- le prompt décrit une photo (« photorealistic, ultra detailed… ») plus la zone **Prompt à donner**,
+  au lieu du prompt « texture de jeu » du matériau
+  détecté : sur une image, la détection se trompe (un dessin pris pour du tissu se couvre de fils) ;
+- une **passe globale** d'abord : le modèle voit l'image entière à environ 1 mégapixel et la réinvente
+  au denoise du curseur ; les morceaux n'affinent ensuite qu'à la moitié de ce denoise (0,25 à 0,45),
+  sinon chacun invente son propre motif ;
+- le contrôle qualité n'est plus qu'un garde-fou (structure, couleurs et palette très assouplies) et
+  le verrou des couleurs passe de 0,6 à 0,25.
+Pour une **texture de jeu**, l'éclairage inventé (reflets, ombres) est faux en jeu : le moteur éclaire
+déjà la texture. Ce rendu convient surtout aux images, illustrations et captures.
+
+**Prompt à donner** (zone de texte) : ce que doit produire l'IA, ajouté au prompt de chaque texture
+du lancement. Un modèle de diffusion génère une image qui correspond à une description : « rusty
+scratched metal, deep cracks » marche mieux que « ajoute de la rouille ». SDXL comprend surtout
+l'anglais ; Z-Image (encodeur Qwen3) comprend aussi le français. Sous la zone, l'aperçu montre le
+prompt réellement envoyé. Case **Prompt seul, sans ajouts** : seul ce texte part (plus de préfixe,
+de prompt de matériau ni de suffixe). Une règle `[[rules]]` avec `hint` s'ajoute toujours en tête.
+
+Bouton **✨ Détailler en anglais…** : un modèle de langage local réécrit ton texte (en français ou en
+anglais) en un prompt anglais beaucoup plus détaillé. Il décrit les matières, le micro-détail, l'usure
+et les nuances de couleur, sans ajouter d'objet, de texte ou de logo. Le résultat s'ouvre dans un
+**aperçu** modifiable avec trois boutons :
+- **Utiliser ce prompt** remplace la zone (Ctrl+Z dans la zone rend ton texte) ;
+- **↻ Régénérer** propose une autre version ;
+- **Annuler** ne change rien.
+
+Les consignes données au modèle dépendent de deux réglages :
+- **Rendu** : *Fidèle* garde un éclairage neutre, sans ombres ni reflets incrustés, pour que le jeu
+  éclaire lui-même la texture ; *Photoréaliste* vise un rendu de photographie.
+- **Famille** : 30 à 60 mots pour SDXL / SD 1.5, dont l'encodeur CLIP ne lit qu'environ 75 mots ;
+  70 à 130 mots pour Z-Image.
+
+Moteur, dans cet ordre :
+1. ComfyUI lui-même (nœud `TextGenerate` des versions récentes) avec l'encodeur Qwen3-4B de Z-Image
+   Turbo (`qwen_3_4b.safetensors`, déjà présent si la famille Z-Image fonctionne). Le premier appel
+   charge le modèle : 10 à 30 s.
+2. Sinon LM Studio (port 1234) ou Ollama (port 11434), lancés avec un modèle.
+
+Rien ne quitte le PC.
+
+**Denoise auto (maximum)** (case sous le curseur) : le curseur se place au maximum du rendu et se
+verrouille ; la valeur choisie à la main revient quand on décoche.
+- Fidèle : 0,60, le plus fort denoise que la validation accepte d'ordinaire sans voir la texture
+  transformée. Si elle la juge trop éloignée de l'original, TEXFORGE redescend d'un palier (0,49, puis
+  0,41). Avec la génération par morceaux, le palier se choisit sur un essai à 1 mégapixel (quelques
+  secondes) avant de lancer les morceaux ; sans morceaux, chaque nouvel essai de la texture prend le
+  palier suivant. Résultat : le plus de détail possible sans transformer la texture.
+- Photoréaliste créatif : 1,00 pour la passe globale, puis 0,85 et 0,70 si le garde-fou échoue.
+
+**Famille Z-Image Turbo** : Z-Image Turbo (6 milliards de paramètres, 8 pas) avec son ControlNet
+Tile officiel, `Z-Image-Turbo-Fun-Controlnet-Tile-2.1-lite-2601-8steps.safetensors` (2,0 Go, licence
+Apache-2.0, huggingface.co/alibaba-pai/Z-Image-Turbo-Fun-Controlnet-Union-2.1) dans
+`models\model_patches`. La version « lite » tient dans 16 Go de VRAM avec le modèle ; la complète
+(6,7 Go) dépasse. Le ControlNet Tile tient les formes : le denoise des préréglages est multiplié
+par 1,3. Sans son fichier, TEXFORGE le retire du workflow (img2img doux, denoise ×0,75) et le dit ;
+à ce réglage, l'IA ne fait presque que lisser, le résultat ressemble à l'original.
+
+**Real-ESRGAN** sert de base à l'IA par morceaux : sans lui, les morceaux partent d'un
+agrandissement Lanczos flou et l'IA ajoute peu. Un chemin réglé qui n'existe plus est remplacé par
+celui que TEXFORGE trouve (`tools\`, PATH), avec une ligne dans la console ; s'il n'y en a aucun,
+un avertissement s'affiche au lancement.
+
+**IA par morceaux à la taille finale** : le modèle travaille à environ 1 mégapixel (1024×1024 en
+SDXL, 512×512 en SD 1.5). En une seule passe, une texture de 1024 px gagne du détail à 1024 px, puis
+son passage en 4096 n'est qu'un agrandissement classique ; une texture de 2048 en perd même. Avec
+l'option, la texture est d'abord agrandie à sa taille finale (Real-ESRGAN s'il est installé, sinon
+Lanczos), puis générée morceau par morceau à la résolution native du modèle, avec 128 px de
+recouvrement fondu entre morceaux et une marge en boucle pour les textures répétables. Coût : une
+texture de 2048 = 9 morceaux, une de 4096 = 25 morceaux de 1024² (SDXL, 28 pas à denoise 0,42),
+soit plusieurs minutes par texture en 4096 ; le temps restant affiché pendant la génération donne
+la vraie mesure sur ta carte.
+Réglages équivalents dans `texforge.toml` : `[routing] force_ai = true`, `[comfyui] tiled = true`,
+`tile_size`, `tile_overlap`.
+
+**Durée totale estimée** (ligne bleue sous la barre de progression) : dès la fin de l'analyse,
+TEXFORGE annonce la durée du lancement entier (génération, puis contrôle qualité et export), le temps
+restant et l'heure de fin ; la console l'écrit aussi (`[ESTIMATION] ≈ 2 h 10 au total — génération
+~1 h 55 : 480 passage(s) ComfyUI × ~14 s…`).
+- Le calcul compte les **passages** ComfyUI comme le moteur les fera : 1 par texture en une passe ;
+  par morceaux, 1 par morceau (4096² = 25, 2048² = 9, plus la marge des textures répétables), plus la
+  passe globale du rendu photoréaliste ou l'essai du denoise automatique. Agrandissements locaux,
+  Real-ESRGAN et export se comptent au mégapixel produit.
+- Pendant la génération, l'estimation se recale sur la durée réelle des passages déjà faits et sur
+  les essais en plus des textures refusées par la validation ; le temps restant se décompte chaque
+  seconde entre deux recalages.
+- À la fin, la durée réelle s'affiche à côté de l'estimation de départ, et les durées mesurées sont
+  mémorisées (`timings.json` dans `%LOCALAPPDATA%\TEXFORGE`, une valeur par famille de modèles) : le
+  lancement suivant part d'elles. Au tout premier lancement, la durée d'un passage est une valeur
+  indicative (Z-Image Turbo avec ControlNet Tile 16 s, SDXL 12 s, SD 1.5 3,5 s), donc l'annonce de
+  départ peut être fausse du simple au double ; elle se corrige dès les premiers passages.
 
 ### Mode sans ComfyUI : Real-ESRGAN réaliste
 
@@ -272,7 +404,7 @@ attribue une route :
 | Route | Critères | Traitement |
 |---|---|---|
 | **UI** | nom explicite (`hud`, `font`, `icon`, `minimap`, `menu`, `button`…) ou score UI ≥ `ui_threshold` : aplats, peu de couleurs, contours nets, transparence découpée, glyphes | Real-ESRGAN `realesr-animevideov3` → Waifu2x → Lanczos, par dossier entier (1 lancement par lot) |
-| **COMFYUI** | textures de surface avec du détail : matériau détecté (pierre, maçonnerie, métal, bois, tissu, végétation, générique) | workflow Tile (ou Tile+Canny pour les joints), denoise / force ControlNet par matériau |
+| **COMFYUI** | textures de surface avec du détail : matériau détecté (pierre, maçonnerie, métal, bois, tissu, végétation, générique) ; avec `force_ai = true`, tout sauf normal maps, cartes de données, polices et textures minuscules | workflow Tile (ou Tile+Canny pour les joints), denoise / force ControlNet par matériau, par morceaux si `tiled = true` |
 | **LOCAL** | normal maps (Z dans le bleu ; DXT5nm d'Unity et d'autres moteurs, X dans l'alpha et Y dans le vert ; BC5, X et Y dans le rouge et le vert — reconnues au contenu, même avec un nom en empreinte), masques et cartes de données, verre, textures trop petites ou trop allongées ; peau si `skin_route = "local"` | Lanczos canal par canal, jamais d'IA |
 | **KEEP** | < 8 px, tables de couleurs | copie |
 
@@ -504,6 +636,9 @@ summary = Orchestrator(cfg, bus).run(stages=["ui", "ai"])
 | Symptôme | Cause probable | Correctif |
 |---|---|---|
 | Aucune texture analysée, seulement un `qc_report.json` en sortie (versions précédentes) | Entrée = dossier d'installation d'un jeu dont les textures sont dans des archives | Dump Special K d'abord, puis entrée = `SK_Res\dump\textures` ; supprimer le `qc_report.json` égaré |
+| `Node 'TEXFORGE_TILING' not found` | Pack `ComfyUI-seamless-tiling` absent (le message cite le **titre** du nœud, son type est `SeamlessTile`) et TEXFORGE antérieur à 0.3.1 | Vérifier la ligne `[INFO] TEXFORGE 0.3.x lancé depuis …` (0.3.1 ou plus) au lancement : si elle manque ou indique un autre dossier, la copie lancée n'est pas la copie à jour. Ou installer le pack avec ComfyUI Manager |
+| Visage ou peau rendu identique à l'original, « 0 ComfyUI » | Voulu : peau et visages sont agrandis sans IA générative (`skin_route = "local"`), l'IA redessinerait les traits | Régler Real-ESRGAN : les textures déjà agrandies par Lanczos faute de Real-ESRGAN sont refaites au lancement suivant (ligne `[LOCAL] … refaite(s) avec Real-ESRGAN`) |
+| `FileNotFoundError` sur une texture | Fichier supprimé ou renommé depuis un scan précédent | Mis de côté automatiquement au scan suivant (statut `missing`) |
 | `[COMFYUI] serveur injoignable` | ComfyUI non lancé ou autre port | Lancer ComfyUI, vérifier `server` |
 | Arrêt « workflow refusé » | Nœud ou modèle manquant dans ComfyUI | Le message nomme le nœud ; installer le nœud ou corriger le nom du modèle |
 | Beaucoup de `[RETRY] … oom` | VRAM saturée | `max_in_flight = 1`, `vram_threshold_gb = 3`, ou un checkpoint SD 1.5 |
@@ -529,6 +664,8 @@ summary = Orchestrator(cfg, bus).run(stages=["ui", "ai"])
 ## Structure
 
 ```
+app_gui.py                   interface graphique
+gui_compare.py               panneau avant / après de l'interface (vues synchronisées)
 texforge/
   routing.py                 routage UI / ComfyUI / local, détection du matériau
   ui_upscale.py              pipeline UI : Real-ESRGAN / Waifu2x ncnn par lots, Lanczos
@@ -538,6 +675,10 @@ texforge/
   events.py                  tableau de bord console + events.jsonl + JSON pour Node
   state.py                   base SQLite : textures, résultats, échecs
   remaster.py                chaîne complète (scan → génération → QC → DDS), réglages, progression globale
+  eta.py                     estimation du temps : passages ComfyUI par texture, durées apprises (timings.json)
+  updater.py                 mise à jour depuis GitHub : vérification, contrôles, sauvegarde, retour arrière
+  release.json               liste des fichiers de la version et de leurs empreintes (envoi partiel refusé)
+  prompt_enhance.py          prompt détaillé en anglais (Qwen3-4B dans ComfyUI, sinon LM Studio / Ollama)
   qc.py                      contrôle qualité final : mesures, verrou couleur, fondu du raccord, décision
   metrics.py                 CIELAB/ΔE2000, SSIM multi-échelle, palette, détail, raccords
   ddsbuild.py                format DDS, mipmaps (linéaire, couverture alpha), texconv ou intégré, relecture
@@ -547,6 +688,7 @@ texforge/
   validate.py                contrôles automatiques
   pipeline.py                scan, règles, export
   review.py                  galerie HTML
+  compare.py                 données du panneau avant / après (textures traitées, image et légende)
   unreal.py                  jeux Unreal : moteur, chiffrement et compression lus dans les en-têtes, conseils
   ba2.py                     archives BA2 (Fallout 4, Fallout 76, Starfield) : lecture, extraction des textures
   detect.py                  dossier de départ -> dossier des textures (Special K, SKIF, RTX Remix, BA2, fichiers)

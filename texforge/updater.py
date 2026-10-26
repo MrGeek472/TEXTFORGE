@@ -15,6 +15,7 @@ en place. Les fichiers locaux absents du dépôt ne sont jamais supprimés. Reto
 from __future__ import annotations
 
 import ast
+import hashlib
 import http.client
 import json
 import os
@@ -42,6 +43,9 @@ ENTRY_POINTS = ("texforge/__init__.py", "texforge/__main__.py", "app_gui.py")
 MAX_ARCHIVE = 300 * 2 ** 20
 KEEP_BACKUPS = 3
 NETWORK_ERRORS = (OSError, http.client.HTTPException, ValueError)
+# Liste des fichiers d'une version et de leur empreinte : un envoi partiel sur GitHub (seulement texforge/, par
+# exemple) laisserait un app_gui.py ancien à côté de modules neufs ; il est refusé avant toute écriture.
+RELEASE_FILE = "texforge/release.json"
 
 
 class UpdateError(Exception):
@@ -100,11 +104,11 @@ def installed_version(root: Path | None = None) -> str:
 
 # ------------------------------------------------------------------ réseau
 
-def _open(url: str, timeout: float, accept: str | None = None):
-    headers = {"User-Agent": f"TEXFORGE/{__version__}"}
+def _open(url: str, timeout: float, accept: str | None = None, headers: dict | None = None):
+    h = {"User-Agent": f"TEXFORGE/{__version__}", **(headers or {})}
     if accept:
-        headers["Accept"] = accept
-    return urllib.request.urlopen(urllib.request.Request(url, headers=headers), timeout=timeout)
+        h["Accept"] = accept
+    return urllib.request.urlopen(urllib.request.Request(url, headers=h), timeout=timeout)
 
 
 def _get(url: str, timeout: float, accept: str | None = None) -> bytes:
@@ -122,6 +126,45 @@ def _reason(exc: BaseException) -> str:
     return str(getattr(exc, "reason", None) or exc)
 
 
+# Vérifications fréquentes (toutes les 2 min) : requête conditionnelle (ETag) à l'API, réponse 304 « rien de
+# changé » sans corps ; version lue une seule fois par commit ; API limitée -> branche par défaut lue
+# directement jusqu'à la levée de la limite.
+_CACHE: dict = {"etag": "", "commit": None, "versions": {}, "api_blocked_until": 0.0}
+
+
+def _latest_commit(timeout: float) -> dict | None:
+    url = f"{_base('API', 'https://api.github.com')}/repos/{repo()}/commits/HEAD"
+    if time.time() < _CACHE["api_blocked_until"]:
+        return None
+    cached = _CACHE["commit"] if _CACHE.get("commit_url") == url else None
+    headers = {"If-None-Match": _CACHE["etag"]} if cached and _CACHE["etag"] else {}
+    try:
+        with _open(url, timeout, "application/vnd.github+json", headers) as r:
+            body, etag = r.read(4 * 2 ** 20), r.headers.get("ETag") or ""
+    except urllib.error.HTTPError as exc:
+        if exc.code == 304 and cached:
+            return cached
+        if exc.code in (403, 429):
+            reset = exc.headers.get("X-RateLimit-Reset") if exc.headers else None
+            try:
+                _CACHE["api_blocked_until"] = min(float(reset), time.time() + 3600) if reset else time.time() + 900
+            except ValueError:
+                _CACHE["api_blocked_until"] = time.time() + 900
+        return None
+    except (*NETWORK_ERRORS, KeyError, TypeError):
+        return None
+    try:
+        j = json.loads(body)
+        commit = j.get("commit") or {}
+        lines = str(commit.get("message") or "").strip().splitlines()
+        info = {"sha": str(j["sha"]), "date": str((commit.get("committer") or {}).get("date") or ""),
+                "message": lines[0][:200] if lines else ""}
+    except (ValueError, KeyError, TypeError, AttributeError):
+        return None
+    _CACHE.update(etag=etag, commit=info, commit_url=url)
+    return info
+
+
 def check(timeout: float = 15.0) -> dict:
     """État de la mise à jour : versions installée, en cours et du dépôt, commit, message, erreur éventuelle."""
     root = install_root()
@@ -130,23 +173,20 @@ def check(timeout: float = 15.0) -> dict:
            "available": False, "newer_local": False, "sha": None, "date": "", "message": "", "error": "",
            "git": (root / ".git").exists(), "restart": vtuple(local) > vtuple(__version__),
            "backup": (last_backup(root) or {}).get("from")}
-    try:
-        j = json.loads(_get(f"{_base('API', 'https://api.github.com')}/repos/{repo()}/commits/HEAD", timeout,
-                            "application/vnd.github+json"))
-        out["sha"] = str(j["sha"])
-        commit = j.get("commit") or {}
-        out["date"] = str((commit.get("committer") or {}).get("date") or "")
-        lines = str(commit.get("message") or "").strip().splitlines()
-        out["message"] = lines[0][:200] if lines else ""
-    except (*NETWORK_ERRORS, KeyError, TypeError):
-        pass                                  # API limitée ou injoignable : version lue sur la branche par défaut
-    try:
-        text = _get(f"{_base('RAW', 'https://raw.githubusercontent.com')}/{repo()}/{out['sha'] or 'HEAD'}"
-                    f"/texforge/__init__.py", timeout).decode("utf-8", "replace")
-    except NETWORK_ERRORS as exc:
-        out["error"] = tr("vérification impossible : {why}", why=_reason(exc))
-        return out
-    remote = version_in(text)
+    commit = _latest_commit(timeout)          # None : API limitée ou injoignable -> branche par défaut
+    if commit:
+        out.update(commit)
+    raw_url = f"{_base('RAW', 'https://raw.githubusercontent.com')}/{repo()}/{out['sha'] or 'HEAD'}/texforge/__init__.py"
+    remote = _CACHE["versions"].get(raw_url) if out["sha"] else None
+    if remote is None:
+        try:
+            text = _get(raw_url, timeout).decode("utf-8", "replace")
+        except NETWORK_ERRORS as exc:
+            out["error"] = tr("vérification impossible : {why}", why=_reason(exc))
+            return out
+        remote = version_in(text)
+        if remote and out["sha"]:
+            _CACHE["versions"][raw_url] = remote        # un commit ne change jamais : lu une seule fois
     if not remote:
         out["error"] = tr("version introuvable dans le dépôt {repo}", repo=repo())
         return out
@@ -275,6 +315,12 @@ def _validate(new: Path, files: dict[str, Path], remote: str, root: Path) -> Non
     if got != remote:
         raise UpdateError(tr("l'archive contient la version {got} au lieu de {want} — rien n'a été modifié",
                              got=got, want=remote))
+    stale = release_mismatch(files, remote)
+    if stale:
+        raise UpdateError(tr("envoi incomplet sur GitHub : {n} fichier(s) de la version {v} absent(s) ou ancien(s) "
+                             "dans le dépôt ({files}) — rien n'a été modifié. Envoie tout le contenu du zip de la "
+                             "version, dossiers compris.", n=len(stale), v=remote,
+                             files=", ".join(stale[:5]) + (" …" if len(stale) > 5 else "")))
     for rel, path in sorted(files.items()):
         if rel.endswith(".py"):
             try:
@@ -287,6 +333,51 @@ def _validate(new: Path, files: dict[str, Path], remote: str, root: Path) -> Non
         shown = ", ".join(f"{m.replace('.', '/')}.py ({tr('importé par {file}', file=f)})" for f, m in miss[:4])
         raise UpdateError(tr("dépôt incomplet, module(s) absent(s) : {list} — rien n'a été modifié. Publie tous "
                              "les fichiers de la version sur GitHub.", list=shown))
+
+
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def release_files(root: Path) -> list[str]:
+    """Fichiers qui font une version (code, workflows, scripts) : ni README ni licence (souvent adaptés sur
+    GitHub), ni outils téléchargés (tools/<dossier>/), ni caches."""
+    out = []
+    for f in sorted(root.rglob("*")):
+        rel = f.relative_to(root).as_posix()
+        parts = rel.split("/")
+        if not f.is_file() or any(p in SKIP_DIRS for p in parts[:-1]) or rel.endswith(SKIP_SUFFIXES):
+            continue
+        if parts[-1] in SKIP_FILES or parts[-1].endswith(".texforge-maj") or rel == RELEASE_FILE:
+            continue
+        if len(parts) == 1 and (parts[0].upper().startswith(("README", "LICENCE", "LICENSE"))):
+            continue
+        if parts[0] == "tools" and len(parts) > 2:
+            continue
+        out.append(rel)
+    return out
+
+
+def write_release(root: Path | None = None) -> dict:
+    """Écrit texforge/release.json (à faire à chaque version publiée)."""
+    root = (root or install_root()).resolve()
+    data = {"version": installed_version(root), "files": {rel: _sha256(root / rel) for rel in release_files(root)}}
+    (root / RELEASE_FILE).write_text(json.dumps(data, indent=1, sort_keys=True) + "\n", encoding="utf-8")
+    return data
+
+
+def release_mismatch(files: dict[str, Path], remote: str) -> list[str]:
+    """Fichiers de la version annoncée par texforge/release.json absents de l'archive ou différents."""
+    if RELEASE_FILE not in files:
+        return []                                         # version publiée avant cette vérification
+    try:
+        data = json.loads(files[RELEASE_FILE].read_text(encoding="utf-8"))
+        listed = dict(data["files"])
+    except (OSError, ValueError, KeyError, TypeError):
+        return [RELEASE_FILE]
+    if data.get("version") != remote:
+        return [f"{RELEASE_FILE} ({data.get('version')})"]
+    return [rel for rel, h in sorted(listed.items()) if rel not in files or _sha256(files[rel]) != h]
 
 
 def _python() -> str:
