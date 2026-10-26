@@ -1,13 +1,13 @@
 {
  "files": {
-  "app_gui.py": "6678dda3d71e33dc399b7bd5b582b1b21d595b7824016607341a7c0825586069",
+  "app_gui.py": "e5eb9e0bfe93e9c43acb1e90b6a1ca6df0aa1004281fb82ae4e967e8fc00cacf",
   "bridge/example.mjs": "f57b9bc66083d7b579c2fe96cabad69d1553fec0a41a627a443f65a6548c59cc",
   "bridge/texforge-bridge.mjs": "7edfb0af727a5d2dbadc324360aa4c59e8e101ffd662b719c3baf9fcdd89e63c",
   "gui_compare.py": "40eaf048b6c58285038fea0ce0d31dee45c121e641376e5d4913c7b2bd7d34fe",
   "requirements.txt": "8e39b2786b46ea733698c111ce90dd7a36d4204e88a634dde8dc413e48c90878",
   "texforge.bat": "104b3bf6795c1250edc2eb4b737bb7ab0033b8717293243f2af6e124e26c2566",
-  "texforge/__init__.py": "3e87222367054efb83b60cb9cd9b5eea9ec400c1b4e0b8ae1755cca6f5505159",
-  "texforge/__main__.py": "927b86a18b1cce156df9c03de7ce0d2ad92c98cad7f8ba7dfc808a277e46917a",
+  "texforge/__init__.py": "df2917844861d5a1e18d6322e9c665b52fff539d1bb98618ca9114ba4a70af6f",
+  "texforge/__main__.py": "51ad5793f4dd4d3f9b62d3e58e6e23007477b3ba170f730884bb233d161b624c",
   "texforge/ba2.py": "ae446ac66b60ecded0c2157b8a8dabc2b1db9f65082f9c914e44b26e921ed66e",
   "texforge/comfyui_headless_client.py": "5ebc2ad14b73eadab9b67de9b8891e46e8f92c3179477f47ebb8a1ac829393cb",
   "texforge/compare.py": "9614171336bbd4fd4d425f720409a8a6167269e90ef8383ca5b90d6562b5d2bc",
@@ -21,7 +21,7 @@
   "texforge/i18n.py": "2d9d10bfc0c038fee9df9c6e065324a54232f1820b8e1217b10b5c362e4145a3",
   "texforge/imaging.py": "8b41e68ba5eb74dc7961560e6e6c42fad883be69ea6f28407cdd02c2ee698d1b",
   "texforge/locales/__init__.py": "985afd2a1cd91f2e5195a17440735e03159804b29da12c6152e2f3f28a19ec94",
-  "texforge/locales/en.py": "0f34e75e55c1df2e3f04048121791c76f5b39b990c95701cb808d54980b5e16d",
+  "texforge/locales/en.py": "d2a0f9630d3891559fd3a4d37ef60dd1b0ac4d303ee06e49b0c51ce33634ee18",
   "texforge/metrics.py": "2685abcf8981612f720cbcb02cd15c0b449cdeb2754315c84e1f84ee5b8061dd",
   "texforge/orchestrator.py": "3c084842c7ab5ea0fe5a57d59dbf3662b1fa984b0ded9ae5d279f6380ddf0706",
   "texforge/pipeline.py": "851daed09b9ca937dd7fe026b0b7391ece281980bc7137cc01cd965702b9ac60",
@@ -29,16 +29,14 @@
   "texforge/prompt_enhance.py": "b87f907124e46b59c21eedfe1c0ce7f5da9cb002c53df78e6dc15750405c5e79",
   "texforge/providers.py": "953d71b573ee11e1ecc4e45441435b7ee884ce381dfbaec0b1bef4ae42f1ecd7",
   "texforge/qc.py": "b9423a617e45bc17cfc02a0c00259f13be769c799a6c1b13f7f4cebb6524f617",
-  "texforge/release_key.txt": "182ef01c5c5ca1217d6f28750865185f6a491608d05910f6dfc5a6089c2f6de7",
   "texforge/remaster.py": "6366f280a3d73bbc93c576378332356c959d3014e028a69c41fb2891907e264b",
   "texforge/review.py": "3aecb723ea39787894a1785a4b138cd2ca7e72adbc49481cff716eb41fffcc8c",
   "texforge/routing.py": "3ed74b71aecf80eb0142d9e3e8549d1294940b7288cc92a7b1d7d80d96916d80",
-  "texforge/selftest.py": "05324d94df6c7ed94c8067e1a39614d6dea91e5a3f18d086981344a4e0cf750f",
-  "texforge/signing.py": "52b164b3bbfcef2693a829b68456679be7ad702e3062fb8d0ab13721215983cd",
+  "texforge/selftest.py": "7823646e352c631b567e4fd0c9acc41932df311d0df920ad866294a5106d213d",
   "texforge/state.py": "86dd3c5bcbd10eb87bfc7a9ef46041c19d97645b44b3d4677cec4f11ba1150be",
   "texforge/ui_upscale.py": "3433405ebffd92012709a58f83fcdd78c67a15bcd265082613dc82e89b136d3e",
   "texforge/unreal.py": "79b7d3aca6df3e7ecea390a3d8892780207c9130bef21ff2e257221826c5fce9",
-  "texforge/updater.py": "b205b10d4367e254b0081400fa633788b43575d03b20c4875229f77fbc415a5a",
+  "texforge/updater.py": "8c562bcf482c008435793a9241c4258eff1f542ca05cfb62096ad85eae311488",
   "texforge/validate.py": "c05f48a9798c50482aaa4056e086328acba718f7458b2ce4b0238178fa05f3ab",
   "texforge_gui.bat": "9c25bd830970fa577b68e64862e3e3cdfbb2785ad5d7e454ce8330bd68fada4d",
   "workflows/texforge_sd15_tile_api.json": "4866b6dc381d240d1191e9c25528cd43d7d54a140b0f095f1f30321eca587049",
@@ -47,5 +45,5 @@
   "workflows/texforge_zimage_turbo_api.json": "947d731b89fbd611cd51978defe130d3046e8d755613b1c9c4c5e24966a62097",
   "workflows/texforge_zimage_turbo_tile_api.json": "24e6e5a2cbe34876fec344a3ee3046f00f1d49e7332a399f7fa9d367b4a3cbc1"
  },
- "version": "0.5.7"
+ "version": "0.5.8"
 }

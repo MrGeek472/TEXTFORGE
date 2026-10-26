@@ -2452,12 +2452,6 @@ class MainWindow(QMainWindow):
             tip = tr("TEXFORGE {local} est à jour (dépôt GitHub {repo}).", local=r.get("local"), repo=r.get("repo", ""))
         else:
             tip = tr("Mises à jour : vérification au démarrage…")
-        if r.get("remote") and not self._updating:
-            tip += "\n" + (tr("Mises à jour signées : seules les versions signées par ta clé ({fp}) sont acceptées.",
-                              fp=r.get("fingerprint", "")) if r.get("signed") else
-                           tr("Mises à jour NON signées : quiconque prendrait le contrôle du dépôt GitHub pourrait "
-                              "publier une version.\nClic sur la pastille → « Préparer une version signée » pour "
-                              "activer la signature."))
         if self._update_checked_at and not self._updating:
             tip += "\n" + tr("Dernière vérification : {t}", t=time.strftime("%H:%M", time.localtime(self._update_checked_at)))
         self.update_pill.setText(text)
@@ -2482,7 +2476,7 @@ class MainWindow(QMainWindow):
         auto.setChecked(str(self.qs.value("update_auto", "true")).lower() in ("true", "1"))
         auto.toggled.connect(lambda on: self.qs.setValue("update_auto", bool(on)))
         menu.addSeparator()
-        pub = menu.addAction(tr("Préparer une version signée à publier sur GitHub…"))
+        pub = menu.addAction(tr("Préparer le dossier à publier sur GitHub…"))
         pub.setEnabled(self.worker is None and not self._updating)
         pub.triggered.connect(self._publish_release)
         back = updater.last_backup()
@@ -2494,17 +2488,7 @@ class MainWindow(QMainWindow):
         menu.exec(self.update_pill.mapToGlobal(self.update_pill.rect().bottomLeft()))
 
     def _publish_release(self) -> None:
-        """Dossier prêt à envoyer sur GitHub, signé avec la clé de l'auteur (créée la première fois)."""
-        first = updater.read_key_file(updater.key_path()) is None
-        intro = tr("Prépare un dossier sur le Bureau avec exactement les fichiers de cette version, la liste de leurs "
-                   "empreintes et sa signature.\nEnvoie ensuite le CONTENU de ce dossier sur GitHub.")
-        if first:
-            intro += "\n\n" + tr("Première fois : une clé de signature est créée dans\n{path}\nNe la publie jamais, "
-                                  "sauvegarde-la hors de ce PC (clé USB). Dès que ce dossier est publié, tes "
-                                  "installations n'accepteront plus que les versions signées avec cette clé.",
-                                  path=updater.key_path())
-        if QMessageBox.question(self, APP_NAME, intro) != QMessageBox.Yes:
-            return
+        """Dossier prêt à envoyer sur GitHub : exactement les fichiers de la version et leur liste d'empreintes."""
         desk = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
         parent = Path(desk) if desk and Path(desk).is_dir() else None
 
@@ -2514,15 +2498,12 @@ class MainWindow(QMainWindow):
                 self.console.add(tr("[PUBLICATION] ✗ {err}", err=err))
                 QMessageBox.warning(self, APP_NAME, plain(err))
                 return
-            self.console.add(tr("[PUBLICATION] TEXFORGE {v} signée (clé {fp}) : {n} fichiers dans {dest}",
-                                v=res["version"], fp=res["fingerprint"], n=res["files"], dest=res["dest"]))
-            text = tr("Dossier prêt : {dest}\n\nEnvoie son CONTENU sur GitHub (Add file → Upload files, glisse tous "
-                      "les fichiers et dossiers).\nEmpreinte de ta clé : {fp}", dest=res["dest"], fp=res["fingerprint"])
-            if res["created"]:
-                text += "\n\n" + tr("Clé privée créée : {key}\nSauvegarde-la maintenant hors de ce PC.", key=res["key"])
-            QMessageBox.information(self, APP_NAME, text)
+            self.console.add(tr("[PUBLICATION] TEXFORGE {v} : {n} fichiers dans {dest}", v=res["version"],
+                                n=res["files"], dest=res["dest"]))
+            QMessageBox.information(self, APP_NAME, tr(
+                "Dossier prêt : {dest}\n\nEnvoie son CONTENU sur GitHub (Add file → Upload files, glisse tous les "
+                "fichiers et dossiers). Ton README sur GitHub n'est pas touché.", dest=res["dest"]))
             open_path(res["dest"])
-            self.check_updates()
         self._run_task(lambda: updater.publish(parent), done)
 
     def _on_update_clicked(self) -> None:
@@ -2534,9 +2515,6 @@ class MainWindow(QMainWindow):
             return
         msg = tr("Installer TEXFORGE {remote} depuis GitHub ({repo}) ?\n\nVersion installée : {local}.",
                  remote=plain(r["remote"]), repo=r.get("repo", ""), local=r.get("local", "?"))
-        msg += "\n" + (tr("Signature exigée : la version sera refusée si elle n'est pas signée par ta clé ({fp}).",
-                          fp=r.get("fingerprint", "")) if r.get("signed") else
-                       tr("Attention : mises à jour non signées (aucune clé dans cette installation)."))
         if r.get("message"):
             msg += "\n" + tr("Dernier changement : {msg}", msg=plain(r["message"]))
         msg += "\n\n" + tr("La nouvelle version est téléchargée puis contrôlée avant toute écriture ; les fichiers "

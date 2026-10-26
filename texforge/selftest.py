@@ -1113,101 +1113,64 @@ def _selftest_prompt(failures: list) -> None:
 
 
 def _selftest_security(tmp: Path, failures: list) -> None:
-    """Attaques simulées : dépôt GitHub piraté (fichier modifié, autre clé, version non signée, fichier en trop,
-    dépendance venue d'ailleurs), adresse de mise à jour détournée, archives piégées."""
+    """Attaques simulées : fichier modifié après publication, fichiers en trop dans le dépôt, dépendance
+    venue d'ailleurs, adresse de mise à jour détournée, archives piégées."""
     import os
     import zlib
 
-    from . import __version__, ba2, signing, updater
+    from . import __version__, ba2, updater
     from .review import render_page
-
-    vec = [("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
-            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
-            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25"
-            "bf5f0595bbe24655141438e7a100b"),
-           ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
-            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
-            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15"
-            "e9716ed28dc027beceea1ec40a")]
-    ok = all(signing.public_key(bytes.fromhex(sk)) == bytes.fromhex(pk)
-             and signing.sign(bytes.fromhex(sk), bytes.fromhex(m)) == bytes.fromhex(sig)
-             and signing.verify(bytes.fromhex(pk), bytes.fromhex(m), bytes.fromhex(sig))
-             and not signing.verify(bytes.fromhex(pk), bytes.fromhex(m) + b"!", bytes.fromhex(sig))
-             for sk, pk, m, sig in vec)
-    _check(ok, "Ed25519 : vecteurs de test de la RFC 8032 (signature, vérification, message altéré refusé)", failures)
 
     base = tmp / "securite"
     keys = ("TEXFORGE_UPDATE_REPO", "TEXFORGE_UPDATE_API", "TEXFORGE_UPDATE_RAW", "TEXFORGE_UPDATE_CODELOAD",
-            "TEXFORGE_UPDATE_DIR", "TEXFORGE_UPDATE_ROOT", "TEXFORGE_SIGNING_KEY")
+            "TEXFORGE_UPDATE_DIR", "TEXFORGE_UPDATE_ROOT")
     saved = {k: os.environ.get(k) for k in keys}
     os.environ["TEXFORGE_UPDATE_DIR"] = str(base / "donnees")
-    os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle" / "cle_privee.txt")
     try:
         repo = _project_copy(base / "depot", "99.1.0")
+        (repo / "notes_perso.txt").write_text("à ne pas publier", encoding="utf-8")
+        (repo / "texforge" / "release_key.txt").write_text("ancienne clé publique\n", encoding="utf-8")
         pub = updater.publish(base / "publication", root=repo)
         out = Path(pub["dest"])
+        _check(not (out / "README.md").exists() and not (out / "notes_perso.txt").exists()
+               and not (out / "texforge" / "release_key.txt").exists() and (out / updater.RELEASE_FILE).is_file()
+               and (out / "app_gui.py").is_file(),
+               f"dossier à publier : seulement les fichiers de la version ({pub['files']}), ni notes ni ancienne clé",
+               failures)
         root = _project_copy(base / "installation", __version__)
-        shutil.copy2(repo / updater.RELEASE_KEY, root / updater.RELEASE_KEY)     # installation qui connaît la clé
+        (root / "texforge" / "release_key.txt").write_text("ancienne clé publique\n", encoding="utf-8")   # 0.5.7
         os.environ["TEXFORGE_UPDATE_ROOT"] = str(root)
         before = _digest(root)
-        _check(pub["created"] and (out / updater.RELEASE_SIG).is_file() and not (out / "README.md").exists()
-               and not any(p.name == "cle_privee.txt" for p in out.rglob("*"))
-               and updater.local_key(root) is not None,
-               f"publication signée : dossier propre, clé privée hors du dossier publié (empreinte {pub['fingerprint']})",
-               failures)
-
-        def attempt(label: str, tamper, restore, expect: str) -> None:
-            tamper()
-            try:
-                with FakeGitHub(out) as gh:
-                    os.environ.update(gh.env())
-                    updater.apply(updater.check())
-                ok_, why = False, "INSTALLÉE"
-            except updater.UpdateError as exc:
-                ok_, why = any(e in str(exc) for e in ((expect,) if isinstance(expect, str) else expect)), str(exc)
-            finally:
-                restore()
-            _check(ok_ and _digest(root) == before, f"{label} : refusé avant toute écriture ({why[:90]})", failures)
 
         eta = out / "texforge" / "eta.py"
         orig = eta.read_bytes()
-        attempt("dépôt piraté, fichier modifié après signature", lambda: eta.write_bytes(orig + b"\nimport os\n"),
-                lambda: eta.write_bytes(orig), "eta.py")
-        other = base / "pirate"
-        shutil.copytree(out, other)
-        os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle_pirate.txt")
-        (other / updater.RELEASE_KEY).unlink()
-        updater.publish(base / "publication_pirate", root=other)        # le pirate signe avec SA clé
-        os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle" / "cle_privee.txt")
-        pirate = next((base / "publication_pirate").iterdir())
-        saved_files = {r: (out / r).read_bytes() for r in (updater.RELEASE_FILE, updater.RELEASE_SIG, updater.RELEASE_KEY)}
+        eta.write_bytes(orig + b"\nimport os\n")
+        try:
+            with FakeGitHub(out) as gh:
+                os.environ.update(gh.env())
+                updater.apply(updater.check())
+            ok_, why = False, "INSTALLÉE"
+        except updater.UpdateError as exc:
+            ok_, why = "eta.py" in str(exc), str(exc)
+        finally:
+            eta.write_bytes(orig)
+        _check(ok_ and _digest(root) == before, f"fichier modifié après la publication : refusé ({why[:80]})", failures)
 
-        def swap():
-            for r in saved_files:
-                shutil.copy2(pirate / r, out / r)
-
-        def unswap():
-            for r, b in saved_files.items():
-                (out / r).write_bytes(b)
-        attempt("dépôt piraté, re-signé avec une autre clé", swap, unswap, ("SIGNATURE INVALIDE", "INVALID SIGNATURE"))
-        sig = out / updater.RELEASE_SIG
-        attempt("dépôt piraté, version non signée", sig.unlink, lambda: sig.write_bytes(saved_files[updater.RELEASE_SIG]),
-                ("NON SIGNÉE", "NOT SIGNED"))
-
-        trap = out / "texforge" / "porte_derobee.py"
         with FakeGitHub(out) as gh:
-            trap.write_text("raise SystemExit('code pirate exécuté')\n", encoding="utf-8")
-            (out / "sitecustomize.py").write_text("raise SystemExit('code pirate exécuté')\n", encoding="utf-8")
+            (out / "texforge" / "porte_derobee.py").write_text("raise SystemExit('code pirate')\n", encoding="utf-8")
+            (out / "sitecustomize.py").write_text("raise SystemExit('code pirate')\n", encoding="utf-8")
+            (out / "texforge" / "release.sig").write_text("00\n", encoding="utf-8")
             os.environ.update(gh.env())
             res = updater.apply(updater.check())
-        _check(res["to"] == "99.1.0" and not (root / "texforge" / "porte_derobee.py").exists()
-               and not (root / "sitecustomize.py").exists() and updater.installed_version(root) == "99.1.0",
-               "version signée installée ; fichiers ajoutés hors de la liste signée ignorés (ni installés ni importés)",
-               failures)
+        _check(res["to"] == "99.1.0" and updater.installed_version(root) == "99.1.0"
+               and not (root / "texforge" / "porte_derobee.py").exists() and not (root / "sitecustomize.py").exists()
+               and not (root / "texforge" / "release.sig").exists(),
+               "ancien fichier de clé de la 0.5.7 présent : ignoré, mise à jour installée ; fichiers hors de la "
+               "liste ignorés (ni installés ni importés)", failures)
         updater.rollback(root)
 
-        plain_root = _project_copy(base / "installation_sans_cle", __version__)
-        plain_repo = _project_copy(base / "depot_sans_cle", "99.2.0")
+        plain_root = _project_copy(base / "installation_b", __version__)
+        plain_repo = _project_copy(base / "depot_b", "99.2.0")
         req = plain_repo / "requirements.txt"
         req.write_text(req.read_text(encoding="utf-8") + "--extra-index-url http://pirate.example/simple\n",
                        encoding="utf-8")

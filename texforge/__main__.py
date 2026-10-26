@@ -400,10 +400,8 @@ def cmd_update(args) -> int:
         except updater.UpdateError as exc:
             print(f"✗ {exc}", file=sys.stderr)
             return 1
-        print(tr("TEXFORGE {v} signée (clé {fp}) : {n} fichiers dans {dest}\nEnvoie le CONTENU de ce dossier sur "
-                 "GitHub.", v=r["version"], fp=r["fingerprint"], n=r["files"], dest=r["dest"]))
-        if r["created"]:
-            print(tr("Clé privée créée : {key} — sauvegarde-la hors de ce PC, ne la publie jamais.", key=r["key"]))
+        print(tr("TEXFORGE {v} : {n} fichiers dans {dest}\nEnvoie le CONTENU de ce dossier sur GitHub.",
+                 v=r["version"], n=r["files"], dest=r["dest"]))
         return 0
     if args.rollback:
         try:
@@ -420,8 +418,6 @@ def cmd_update(args) -> int:
         return 1
     print(tr("Version installée : {local} — dépôt {repo} : {remote}", local=info["local"], repo=info["repo"],
              remote=info["remote"]))
-    print(tr("Signature exigée (clé {fp})", fp=info["fingerprint"]) if info["signed"]
-          else tr("Mises à jour non signées (texforge update --publish crée une clé et signe la version)"))
     if not info["available"]:
         print(tr("Version installée plus récente que le dépôt : rien à installer.") if info["newer_local"]
               else tr("Aucune mise à jour."))
@@ -659,7 +655,7 @@ def main(argv=None) -> int:
     s.add_argument("--yes", action="store_true", help="installer sans demander confirmation")
     s.add_argument("--rollback", action="store_true", help="revenir à la version d'avant la dernière mise à jour")
     s.add_argument("--publish", nargs="?", const="", default=None, metavar="DOSSIER",
-                   help="préparer une version signée à envoyer sur GitHub (dossier créé dans DOSSIER ou sur le Bureau)")
+                   help="préparer le dossier à envoyer sur GitHub (créé dans DOSSIER ou sur le Bureau)")
     s.set_defaults(fn=cmd_update)
     s = sub.add_parser("detect", help="trouver les dossiers de textures extraites (Special K, RTX Remix)")
     s.add_argument("path", nargs="*", help="dossiers de jeux à inclure dans la recherche")
