@@ -1347,6 +1347,58 @@ MESSAGES: dict[str, str] = {
         'failure in ComfyUI: {err}',
     '{model} (ComfyUI)':
         '{model} (ComfyUI)',
-    "envoi incomplet sur GitHub : {n} fichier(s) de la version {v} absent(s) ou ancien(s) dans le dépôt ({files}) — rien n'a été modifié. Envoie tout le contenu du zip de la version, dossiers compris.":
-        "incomplete upload to GitHub: {n} file(s) of version {v} missing or outdated in the repository ({files}) — nothing was changed. Upload the whole content of the version's zip, folders included.",
+    'Prépare un dossier sur le Bureau avec exactement les fichiers de cette version, la liste de leurs empreintes et sa signature.\nEnvoie ensuite le CONTENU de ce dossier sur GitHub.':
+        'Prepares a folder on the Desktop with exactly the files of this version, the list of their fingerprints and its signature.\nThen upload the CONTENT of that folder to GitHub.',
+    'Préparer une version signée à publier sur GitHub…':
+        'Prepare a signed version to publish on GitHub…',
+    'Dossier prêt : {dest}\n\nEnvoie son CONTENU sur GitHub (Add file → Upload files, glisse tous les fichiers et dossiers).\nEmpreinte de ta clé : {fp}':
+        'Folder ready: {dest}\n\nUpload its CONTENT to GitHub (Add file → Upload files, drag every file and folder).\nYour key fingerprint: {fp}',
+    "Première fois : une clé de signature est créée dans\n{path}\nNe la publie jamais, sauvegarde-la hors de ce PC (clé USB). Dès que ce dossier est publié, tes installations n'accepteront plus que les versions signées avec cette clé.":
+        'First time: a signing key is created in\n{path}\nNever publish it, back it up off this PC (USB stick). Once this folder is published, your installs will only accept versions signed with this key.',
+    '[PUBLICATION] TEXFORGE {v} signée (clé {fp}) : {n} fichiers dans {dest}':
+        '[PUBLISH] TEXFORGE {v} signed (key {fp}): {n} files in {dest}',
+    "Signature exigée : la version sera refusée si elle n'est pas signée par ta clé ({fp}).":
+        'Signature required: the version will be refused unless it is signed with your key ({fp}).',
+    'Attention : mises à jour non signées (aucune clé dans cette installation).':
+        'Warning: unsigned updates (no key in this install).',
+    'Mises à jour signées : seules les versions signées par ta clé ({fp}) sont acceptées.':
+        'Signed updates: only versions signed with your key ({fp}) are accepted.',
+    'Mises à jour NON signées : quiconque prendrait le contrôle du dépôt GitHub pourrait publier une version.\nClic sur la pastille → « Préparer une version signée » pour activer la signature.':
+        'Updates NOT signed: anyone taking over the GitHub repository could publish a version.\nClick the badge → "Prepare a signed version" to turn signing on.',
+    '[PUBLICATION] ✗ {err}':
+        '[PUBLISH] ✗ {err}',
+    'Clé privée créée : {key}\nSauvegarde-la maintenant hors de ce PC.':
+        'Private key created: {key}\nBack it up off this PC now.',
+    'TEXFORGE {v} signée (clé {fp}) : {n} fichiers dans {dest}\nEnvoie le CONTENU de ce dossier sur GitHub.':
+        'TEXFORGE {v} signed (key {fp}): {n} files in {dest}\nUpload the CONTENT of this folder to GitHub.',
+    'Signature exigée (clé {fp})':
+        'Signature required (key {fp})',
+    'Mises à jour non signées (texforge update --publish crée une clé et signe la version)':
+        'Unsigned updates (texforge update --publish creates a key and signs the version)',
+    'Clé privée créée : {key} — sauvegarde-la hors de ce PC, ne la publie jamais.':
+        'Private key created: {key} — back it up off this PC, never publish it.',
+    'morceau démesuré dans {name}':
+        'oversized chunk in {name}',
+    "{n} fichier(s) de la version {v} absent(s) ou différent(s) de la liste publiée ({files}) — rien n'a été modifié. Envoi incomplet sur GitHub (envoie tout le contenu du dossier de la version), ou fichiers modifiés après la publication.":
+        '{n} file(s) of version {v} missing or different from the published list ({files}) — nothing was changed. Incomplete upload to GitHub (upload the whole content of the version folder), or files changed after publishing.',
+    "version du dépôt NON SIGNÉE alors que cette installation exige une signature : refusée, rien n'a été modifié. Si tu n'as pas publié cette version toi-même, ton dépôt GitHub a peut-être été piraté.":
+        'repository version NOT SIGNED while this install requires a signature: refused, nothing was changed. If you did not publish this version yourself, your GitHub repository may have been hacked.',
+    "SIGNATURE INVALIDE : cette version n'a pas été signée par ta clé ({fp}). Refusée, rien n'a été modifié. Si tu n'as pas changé de clé, ton dépôt GitHub a peut-être été piraté : change ton mot de passe GitHub et vérifie les derniers commits.":
+        'INVALID SIGNATURE: this version was not signed with your key ({fp}). Refused, nothing was changed. If you did not change keys, your GitHub repository may have been hacked: change your GitHub password and check the latest commits.',
+    'fichier de clé privée illisible : {path}':
+        'unreadable private key file: {path}',
+    "la clé publique de cette installation ({a}) ne correspond pas à ta clé privée ({b}, {path}). Si tu as perdu l'ancienne clé : supprime {file} puis recommence ; tes autres installations devront être réinstallées à la main depuis le zip.":
+        "this install's public key ({a}) does not match your private key ({b}, {path}). If you lost the old key: delete {file} and try again; your other installs will have to be reinstalled by hand from the zip.",
+    "signature incohérente : rien n'a été publié":
+        'inconsistent signature: nothing was published',
+    'archive du dépôt anormale (plus de {n} fichiers ou de {mb} Mo une fois décompressée) : mise à jour annulée':
+        'abnormal repository archive (more than {n} files or {mb} MB once decompressed): update cancelled',
+    'liste des fichiers de la version illisible ({file})':
+        'unreadable version file list ({file})',
+    "requirements.txt du dépôt refusé, ligne non standard : « {line} » — rien n'a été modifié":
+        'repository requirements.txt refused, non-standard line: "{line}" — nothing was changed',
+    '[MAJ] Signature vérifiée (clé {fp}).':
+        '[UPDATE] Signature verified (key {fp}).',
+    'liste des fichiers de la version absente : refusée':
+        'version file list missing: refused',
 }

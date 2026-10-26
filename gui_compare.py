@@ -175,6 +175,7 @@ class ComparePanel(QWidget):
 
         bottom = QHBoxLayout()
         self.info = QLabel("")
+        self.info.setTextFormat(Qt.PlainText)          # noms de fichiers du jeu : jamais du HTML
         self.info.setWordWrap(True)
         self.info.setStyleSheet("color: #8a93a3;")
         self.zoom_label = QLabel("")

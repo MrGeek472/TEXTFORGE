@@ -4,12 +4,15 @@ Vérification : dernier commit de la branche par défaut (API GitHub) et version
 texforge/__init__.py, comparée à celle installée sur le disque. Seule une version plus récente est
 proposée : une installation plus récente que le dépôt (version pas encore publiée) reste telle quelle.
 
-Mise à jour : archive de ce commit précis, contrôlée avant d'écrire quoi que ce soit — chemins sûrs,
-version attendue, compilation de chaque fichier Python, modules importés présents dans l'archive,
-dépendances (pip si requirements.txt a changé), import d'essai de la nouvelle version dans un processus
-à part. Ensuite seulement, les fichiers qui diffèrent sont remplacés un par un (écriture puis
-remplacement atomique), après copie des originaux dans une sauvegarde ; une erreur d'écriture remet tout
-en place. Les fichiers locaux absents du dépôt ne sont jamais supprimés. Retour arrière : rollback().
+Mise à jour : archive de ce commit précis, contrôlée avant d'écrire ou d'exécuter quoi que ce soit —
+signature Ed25519 de la liste des fichiers (texforge/release.json) par la clé de l'auteur, dès que
+l'installation connaît cette clé (texforge/release_key.txt) ; empreinte de chaque fichier ; chemins sûrs ;
+version attendue ; compilation ; modules importés présents ; dépendances (lignes simples seulement, pip
+si requirements.txt a changé) ; import d'essai dans un processus à part, depuis un dossier qui ne
+contient que les fichiers de la version. Ensuite seulement, les fichiers qui diffèrent sont remplacés un
+par un (écriture puis remplacement atomique), après copie des originaux dans une sauvegarde ; une erreur
+d'écriture remet tout en place. Les fichiers locaux absents du dépôt ne sont jamais supprimés. Retour
+arrière : rollback(). Publication d'une version signée : publish().
 """
 
 from __future__ import annotations
@@ -31,7 +34,7 @@ import zipfile
 from pathlib import Path
 from typing import Callable
 
-from . import __version__
+from . import __version__, signing
 from .i18n import tr
 
 REPO = "MrGeek472/TEXTFORGE"
@@ -46,6 +49,13 @@ NETWORK_ERRORS = (OSError, http.client.HTTPException, ValueError)
 # Liste des fichiers d'une version et de leur empreinte : un envoi partiel sur GitHub (seulement texforge/, par
 # exemple) laisserait un app_gui.py ancien à côté de modules neufs ; il est refusé avant toute écriture.
 RELEASE_FILE = "texforge/release.json"
+RELEASE_SIG = "texforge/release.sig"         # signature Ed25519 de release.json (hexadécimal)
+RELEASE_KEY = "texforge/release_key.txt"     # clé publique de l'auteur : celle de l'installation fait foi
+MAX_EXTRACTED = 400 * 2 ** 20                # archive décompressée : au-delà, bombe de décompression
+MAX_MEMBERS = 5000
+LOOPBACK = ("127.0.0.1", "localhost", "[::1]")
+REQUIREMENT = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]*(\[[A-Za-z0-9._,-]+\])?\s*"
+                         r"((==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_-]+\s*(,\s*(==|>=|<=|~=|!=|<|>)\s*[A-Za-z0-9.*+!_-]+\s*)*)?$")
 
 
 class UpdateError(Exception):
@@ -59,7 +69,11 @@ def repo() -> str:
 
 
 def _base(kind: str, default: str) -> str:
-    return (os.environ.get(f"TEXFORGE_UPDATE_{kind}") or default).rstrip("/")
+    """Adresse du service ; une autre adresse (tests) n'est acceptée qu'en HTTPS ou sur la machine elle-même."""
+    env = (os.environ.get(f"TEXFORGE_UPDATE_{kind}") or "").rstrip("/")
+    if env and (env.startswith("https://") or any(env.startswith(f"http://{h}") for h in LOOPBACK)):
+        return env
+    return default.rstrip("/")
 
 
 def install_root() -> Path:
@@ -157,10 +171,12 @@ def _latest_commit(timeout: float) -> dict | None:
         j = json.loads(body)
         commit = j.get("commit") or {}
         lines = str(commit.get("message") or "").strip().splitlines()
-        info = {"sha": str(j["sha"]), "date": str((commit.get("committer") or {}).get("date") or ""),
+        info = {"sha": str(j["sha"]), "date": str((commit.get("committer") or {}).get("date") or "")[:40],
                 "message": lines[0][:200] if lines else ""}
     except (ValueError, KeyError, TypeError, AttributeError):
         return None
+    if not re.fullmatch(r"[0-9a-f]{40}|[0-9a-f]{64}", info["sha"]):
+        return None                              # identifiant de commit anormal : jamais inséré dans une adresse
     _CACHE.update(etag=etag, commit=info, commit_url=url)
     return info
 
@@ -173,6 +189,8 @@ def check(timeout: float = 15.0) -> dict:
            "available": False, "newer_local": False, "sha": None, "date": "", "message": "", "error": "",
            "git": (root / ".git").exists(), "restart": vtuple(local) > vtuple(__version__),
            "backup": (last_backup(root) or {}).get("from")}
+    key = local_key(root)
+    out["signed"], out["fingerprint"] = key is not None, fingerprint(key) if key else ""
     commit = _latest_commit(timeout)          # None : API limitée ou injoignable -> branche par défaut
     if commit:
         out.update(commit)
@@ -227,6 +245,9 @@ def _extract(archive: Path, dest: Path) -> dict[str, Path]:
     files: dict[str, Path] = {}
     with z:
         members = [m for m in z.infolist() if not m.is_dir()]
+        if len(members) > MAX_MEMBERS or sum(m.file_size for m in members) > MAX_EXTRACTED:
+            raise UpdateError(tr("archive du dépôt anormale (plus de {n} fichiers ou de {mb} Mo une fois "
+                                 "décompressée) : mise à jour annulée", n=MAX_MEMBERS, mb=MAX_EXTRACTED // 2 ** 20))
         names = [m.filename.replace("\\", "/") for m in members]
         tops = {n.split("/", 1)[0] for n in names}
         prefix = f"{tops.pop()}/" if len(tops) == 1 and all("/" in n for n in names) else ""
@@ -317,10 +338,10 @@ def _validate(new: Path, files: dict[str, Path], remote: str, root: Path) -> Non
                              got=got, want=remote))
     stale = release_mismatch(files, remote)
     if stale:
-        raise UpdateError(tr("envoi incomplet sur GitHub : {n} fichier(s) de la version {v} absent(s) ou ancien(s) "
-                             "dans le dépôt ({files}) — rien n'a été modifié. Envoie tout le contenu du zip de la "
-                             "version, dossiers compris.", n=len(stale), v=remote,
-                             files=", ".join(stale[:5]) + (" …" if len(stale) > 5 else "")))
+        raise UpdateError(tr("{n} fichier(s) de la version {v} absent(s) ou différent(s) de la liste publiée "
+                             "({files}) — rien n'a été modifié. Envoi incomplet sur GitHub (envoie tout le contenu "
+                             "du dossier de la version), ou fichiers modifiés après la publication.", n=len(stale),
+                             v=remote, files=", ".join(stale[:5]) + (" …" if len(stale) > 5 else "")))
     for rel, path in sorted(files.items()):
         if rel.endswith(".py"):
             try:
@@ -339,22 +360,28 @@ def _sha256(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+RELEASE_DIRS = ("texforge", "workflows", "bridge")       # dossiers d'une version, en entier
+RELEASE_ROOT_SUFFIXES = (".py", ".bat")                  # + requirements.txt à la racine
+
+
 def release_files(root: Path) -> list[str]:
-    """Fichiers qui font une version (code, workflows, scripts) : ni README ni licence (souvent adaptés sur
-    GitHub), ni outils téléchargés (tools/<dossier>/), ni caches."""
+    """Fichiers qui font une version : à la racine les .py, .bat et requirements.txt, puis les dossiers
+    texforge/, workflows/ et bridge/ (sans caches). Liste fermée : rien d'autre du dossier d'installation
+    (environnement Python, notes, outils téléchargés, README et licence adaptés sur GitHub) n'est publié."""
     out = []
-    for f in sorted(root.rglob("*")):
-        rel = f.relative_to(root).as_posix()
-        parts = rel.split("/")
-        if not f.is_file() or any(p in SKIP_DIRS for p in parts[:-1]) or rel.endswith(SKIP_SUFFIXES):
-            continue
-        if parts[-1] in SKIP_FILES or parts[-1].endswith(".texforge-maj") or rel == RELEASE_FILE:
-            continue
-        if len(parts) == 1 and (parts[0].upper().startswith(("README", "LICENCE", "LICENSE"))):
-            continue
-        if parts[0] == "tools" and len(parts) > 2:
-            continue
-        out.append(rel)
+    for f in sorted(root.iterdir()):
+        if f.is_file() and (f.suffix.lower() in RELEASE_ROOT_SUFFIXES or f.name == "requirements.txt") \
+                and not f.name.endswith(".texforge-maj"):
+            out.append(f.name)
+    for d in RELEASE_DIRS:
+        for f in sorted((root / d).rglob("*")) if (root / d).is_dir() else []:
+            rel = f.relative_to(root).as_posix()
+            parts = rel.split("/")
+            if not f.is_file() or any(p in SKIP_DIRS for p in parts[:-1]) or rel.endswith(SKIP_SUFFIXES):
+                continue
+            if parts[-1] in SKIP_FILES or parts[-1].endswith(".texforge-maj") or rel in (RELEASE_FILE, RELEASE_SIG):
+                continue
+            out.append(rel)
     return out
 
 
@@ -378,6 +405,133 @@ def release_mismatch(files: dict[str, Path], remote: str) -> list[str]:
     if data.get("version") != remote:
         return [f"{RELEASE_FILE} ({data.get('version')})"]
     return [rel for rel, h in sorted(listed.items()) if rel not in files or _sha256(files[rel]) != h]
+
+
+# ------------------------------------------------------------------ signature des versions
+
+def _hex_line(text: str) -> bytes | None:
+    for ln in text.splitlines():
+        ln = ln.strip()
+        if ln and not ln.startswith("#"):
+            try:
+                return bytes.fromhex(ln)
+            except ValueError:
+                return None
+    return None
+
+
+def read_key_file(path: Path) -> bytes | None:
+    try:
+        key = _hex_line(path.read_text(encoding="utf-8"))
+    except OSError:
+        return None
+    return key if key is not None and len(key) == 32 else None
+
+
+def local_key(root: Path | None = None) -> bytes | None:
+    """Clé publique de l'installation : dès qu'elle existe, seules les versions signées sont installées."""
+    return read_key_file((root or install_root()) / RELEASE_KEY)
+
+
+def fingerprint(key: bytes) -> str:
+    h = hashlib.sha256(key).hexdigest()[:16].upper()
+    return " ".join(h[i:i + 4] for i in range(0, 16, 4))
+
+
+def verify_release(files: dict[str, Path], key: bytes) -> None:
+    """Signature de release.json par la clé installée ; lève UpdateError sinon."""
+    if RELEASE_FILE not in files or RELEASE_SIG not in files:
+        raise UpdateError(tr("version du dépôt NON SIGNÉE alors que cette installation exige une signature : "
+                             "refusée, rien n'a été modifié. Si tu n'as pas publié cette version toi-même, ton "
+                             "dépôt GitHub a peut-être été piraté."))
+    sig = _hex_line(files[RELEASE_SIG].read_text(encoding="utf-8", errors="replace"))
+    if sig is None or not signing.verify(key, files[RELEASE_FILE].read_bytes(), sig):
+        raise UpdateError(tr("SIGNATURE INVALIDE : cette version n'a pas été signée par ta clé ({fp}). Refusée, "
+                             "rien n'a été modifié. Si tu n'as pas changé de clé, ton dépôt GitHub a peut-être été "
+                             "piraté : change ton mot de passe GitHub et vérifie les derniers commits.",
+                             fp=fingerprint(key)))
+
+
+def selected_files(files: dict[str, Path]) -> dict[str, Path]:
+    """Fichiers à installer : ceux de la liste de la version (+ liste et signature) ; tout l'archive pour
+    une version publiée avant les listes."""
+    if RELEASE_FILE not in files:
+        return dict(files)
+    try:
+        listed = set(json.loads(files[RELEASE_FILE].read_text(encoding="utf-8"))["files"])
+    except (OSError, ValueError, KeyError, TypeError) as exc:
+        raise UpdateError(tr("liste des fichiers de la version illisible ({file})", file=RELEASE_FILE)) from exc
+    keep = listed | {RELEASE_FILE, RELEASE_SIG}
+    return {rel: p for rel, p in files.items() if rel in keep}
+
+
+def key_path() -> Path:
+    if os.environ.get("TEXFORGE_SIGNING_KEY"):
+        return Path(os.environ["TEXFORGE_SIGNING_KEY"])
+    return data_dir().parent / "signature" / "cle_privee_texforge.txt"
+
+
+def _load_secret(create: bool) -> tuple[bytes | None, bool]:
+    path = key_path()
+    secret = read_key_file(path)
+    if secret is not None or not create:
+        return secret, False
+    if path.exists():
+        raise UpdateError(tr("fichier de clé privée illisible : {path}", path=path))
+    secret = signing.new_secret()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("# Clé privée de signature des versions TEXFORGE (Ed25519).\n"
+                    "# NE JAMAIS LA PUBLIER NI LA PARTAGER. Sauvegarde-la hors de ce PC (clé USB) :\n"
+                    "# sans elle, tes installations refuseront les versions suivantes.\n"
+                    f"{secret.hex()}\n", encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return secret, True
+
+
+def _unique(parent: Path, name: str) -> Path:
+    dest, i = parent / name, 2
+    while dest.exists():
+        dest, i = parent / f"{name}_{i}", i + 1
+    return dest
+
+
+def publish(dest_parent: Path | None = None, root: Path | None = None) -> dict:
+    """Prépare une version à publier : clé créée la première fois (hors du dossier publié), clé publique
+    ajoutée au logiciel, liste des fichiers et empreintes signée, dossier propre à envoyer sur GitHub."""
+    root = (root or install_root()).resolve()
+    secret, created = _load_secret(create=True)
+    pub = signing.public_key(secret)
+    kf = root / RELEASE_KEY
+    current = read_key_file(kf)
+    if current is not None and current != pub:
+        raise UpdateError(tr("la clé publique de cette installation ({a}) ne correspond pas à ta clé privée ({b}, "
+                             "{path}). Si tu as perdu l'ancienne clé : supprime {file} puis recommence ; tes autres "
+                             "installations devront être réinstallées à la main depuis le zip.",
+                             a=fingerprint(current), b=fingerprint(pub), path=key_path(), file=kf))
+    if current is None:
+        kf.write_text("# Clé publique de signature des versions TEXFORGE (Ed25519). Une mise à jour qui n'est pas\n"
+                      "# signée par la clé privée correspondante est refusée.\n"
+                      f"{pub.hex()}\n", encoding="utf-8")
+    rels = release_files(root)
+    data = {"version": installed_version(root), "files": {rel: _sha256(root / rel) for rel in rels}}
+    body = (json.dumps(data, indent=1, sort_keys=True) + "\n").encode("utf-8")
+    sig = signing.sign(secret, body)
+    if not signing.verify(pub, body, sig):
+        raise UpdateError(tr("signature incohérente : rien n'a été publié"))
+    (root / RELEASE_FILE).write_bytes(body)
+    (root / RELEASE_SIG).write_text(sig.hex() + "\n", encoding="utf-8")
+    parent = Path(dest_parent) if dest_parent else (Path.home() / "Desktop" if (Path.home() / "Desktop").is_dir()
+                                                    else Path.home())
+    dest = _unique(parent, f"TEXFORGE_{data['version']}_a_publier")
+    for rel in [*rels, RELEASE_FILE, RELEASE_SIG]:
+        out = dest / rel
+        out.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(root / rel, out)
+    return {"dest": str(dest), "version": data["version"], "files": len(rels) + 2, "created": created,
+            "key": str(key_path()), "fingerprint": fingerprint(pub)}
 
 
 def _python() -> str:
@@ -406,8 +560,23 @@ def _tail(text: str, n: int = 3) -> str:
     return " | ".join(lines[-n:])[-400:]
 
 
+def check_requirements(req: Path) -> None:
+    """Seules les lignes « paquet[extras] opérateur version » passent : ni option (-i, --index-url, -e, -r…),
+    ni adresse, ni chemin, qui feraient installer du code venu d'ailleurs que PyPI."""
+    try:
+        lines = req.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return
+    for ln in lines:
+        line = ln.split("#", 1)[0].strip()
+        if line and not REQUIREMENT.match(line):
+            raise UpdateError(tr("requirements.txt du dépôt refusé, ligne non standard : « {line} » — rien n'a été "
+                                 "modifié", line=line[:120]))
+
+
 def _pip_install(req: Path, python: str, say: Callable[[str], None]) -> None:
-    cmd = [python, "-m", "pip", "install", "--disable-pip-version-check", "-r", str(req)]
+    check_requirements(req)
+    cmd = [python, "-m", "pip", "install", "--disable-pip-version-check", "--no-input", "-r", str(req)]
     try:
         r = _run(cmd, req.parent, 900)
     except (OSError, subprocess.TimeoutExpired) as exc:
@@ -522,6 +691,12 @@ def _install(files: dict[str, Path], root: Path, info: dict, local: str, backup:
     return result
 
 
+def _stage(src: Path, dst: Path) -> Path:
+    dst.parent.mkdir(parents=True, exist_ok=True)
+    shutil.copyfile(src, dst)
+    return dst
+
+
 def _prune(work: Path) -> None:
     """Garde les dernières sauvegardes ; efface les dossiers temporaires d'essais interrompus."""
     try:
@@ -557,10 +732,19 @@ def apply(info: dict, progress: Callable[[int, int], None] | None = None,
         archive = tmp / "depot.zip"
         _download(f"{_base('CODELOAD', 'https://codeload.github.com')}/{repo()}/zip/{info.get('sha') or 'HEAD'}",
                   archive, progress)
-        new = tmp / "depot"
-        files = _extract(archive, new)
+        files = _extract(archive, tmp / "depot")
+        key = local_key(root)
+        if key is not None:
+            verify_release(files, key)           # avant toute autre lecture ou exécution du contenu
+            say(tr("[MAJ] Signature vérifiée (clé {fp}).", fp=fingerprint(key)))
+        # seuls les fichiers de la version sont gardés : rien d'autre ne peut être importé ni installé
+        new = tmp / "verifie"
+        files = {rel: _stage(src, new / rel) for rel, src in selected_files(files).items()}
         say(tr("[MAJ] Contrôle de la nouvelle version ({n} fichiers)…", n=len(files)))
         _validate(new, files, remote, root)
+        if key is not None and RELEASE_FILE not in files:
+            raise UpdateError(tr("liste des fichiers de la version absente : refusée"))
+        check_requirements(new / "requirements.txt")
         pip = _requirements(new / "requirements.txt") != _requirements(root / "requirements.txt") and \
             (new / "requirements.txt").is_file()
         if pip:

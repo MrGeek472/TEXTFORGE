@@ -943,8 +943,9 @@ def _selftest_update(tmp: Path, failures: list) -> None:
             data = gc.read_bytes()
             refused(gc.unlink, lambda: gc.write_bytes(data), "gui_compare", "dépôt incomplet (gui_compare.py absent)")
             bad = good / "texforge" / "casse.py"
-            refused(lambda: bad.write_text("def f(:\n", encoding="utf-8"), bad.unlink, "casse.py",
-                    "erreur de syntaxe dans le dépôt")
+            refused(lambda: (bad.write_text("def f(:\n", encoding="utf-8"), updater.write_release(good)),
+                    lambda: (bad.unlink(), updater.write_release(good)), "casse.py",
+                    "erreur de syntaxe dans un fichier de la version")
             refused(lambda: gh.extra.update({"../evil.py": b"x = 1\n"}), gh.extra.clear, "evil.py",
                     "chemin sortant du dossier dans l'archive")
             app = good / "app_gui.py"
@@ -1109,6 +1110,174 @@ def _selftest_prompt(failures: list) -> None:
             os.environ.pop("TEXFORGE_LLM_URL", None)
         else:
             os.environ["TEXFORGE_LLM_URL"] = saved
+
+
+def _selftest_security(tmp: Path, failures: list) -> None:
+    """Attaques simulées : dépôt GitHub piraté (fichier modifié, autre clé, version non signée, fichier en trop,
+    dépendance venue d'ailleurs), adresse de mise à jour détournée, archives piégées."""
+    import os
+    import zlib
+
+    from . import __version__, ba2, signing, updater
+    from .review import render_page
+
+    vec = [("9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+            "d75a980182b10ab7d54bfed3c964073a0ee172f3daa62325af021a68f707511a", "",
+            "e5564300c360ac729086e2cc806e828a84877f1eb8e5d974d873e065224901555fb8821590a33bacc61e39701cf9b46bd25"
+            "bf5f0595bbe24655141438e7a100b"),
+           ("c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+            "fc51cd8e6218a1a38da47ed00230f0580816ed13ba3303ac5deb911548908025", "af82",
+            "6291d657deec24024827e69c3abe01a30ce548a284743a445e3680d7db5ac3ac18ff9b538d16f290ae67f760984dc6594a7c15"
+            "e9716ed28dc027beceea1ec40a")]
+    ok = all(signing.public_key(bytes.fromhex(sk)) == bytes.fromhex(pk)
+             and signing.sign(bytes.fromhex(sk), bytes.fromhex(m)) == bytes.fromhex(sig)
+             and signing.verify(bytes.fromhex(pk), bytes.fromhex(m), bytes.fromhex(sig))
+             and not signing.verify(bytes.fromhex(pk), bytes.fromhex(m) + b"!", bytes.fromhex(sig))
+             for sk, pk, m, sig in vec)
+    _check(ok, "Ed25519 : vecteurs de test de la RFC 8032 (signature, vérification, message altéré refusé)", failures)
+
+    base = tmp / "securite"
+    keys = ("TEXFORGE_UPDATE_REPO", "TEXFORGE_UPDATE_API", "TEXFORGE_UPDATE_RAW", "TEXFORGE_UPDATE_CODELOAD",
+            "TEXFORGE_UPDATE_DIR", "TEXFORGE_UPDATE_ROOT", "TEXFORGE_SIGNING_KEY")
+    saved = {k: os.environ.get(k) for k in keys}
+    os.environ["TEXFORGE_UPDATE_DIR"] = str(base / "donnees")
+    os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle" / "cle_privee.txt")
+    try:
+        repo = _project_copy(base / "depot", "99.1.0")
+        pub = updater.publish(base / "publication", root=repo)
+        out = Path(pub["dest"])
+        root = _project_copy(base / "installation", __version__)
+        shutil.copy2(repo / updater.RELEASE_KEY, root / updater.RELEASE_KEY)     # installation qui connaît la clé
+        os.environ["TEXFORGE_UPDATE_ROOT"] = str(root)
+        before = _digest(root)
+        _check(pub["created"] and (out / updater.RELEASE_SIG).is_file() and not (out / "README.md").exists()
+               and not any(p.name == "cle_privee.txt" for p in out.rglob("*"))
+               and updater.local_key(root) is not None,
+               f"publication signée : dossier propre, clé privée hors du dossier publié (empreinte {pub['fingerprint']})",
+               failures)
+
+        def attempt(label: str, tamper, restore, expect: str) -> None:
+            tamper()
+            try:
+                with FakeGitHub(out) as gh:
+                    os.environ.update(gh.env())
+                    updater.apply(updater.check())
+                ok_, why = False, "INSTALLÉE"
+            except updater.UpdateError as exc:
+                ok_, why = any(e in str(exc) for e in ((expect,) if isinstance(expect, str) else expect)), str(exc)
+            finally:
+                restore()
+            _check(ok_ and _digest(root) == before, f"{label} : refusé avant toute écriture ({why[:90]})", failures)
+
+        eta = out / "texforge" / "eta.py"
+        orig = eta.read_bytes()
+        attempt("dépôt piraté, fichier modifié après signature", lambda: eta.write_bytes(orig + b"\nimport os\n"),
+                lambda: eta.write_bytes(orig), "eta.py")
+        other = base / "pirate"
+        shutil.copytree(out, other)
+        os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle_pirate.txt")
+        (other / updater.RELEASE_KEY).unlink()
+        updater.publish(base / "publication_pirate", root=other)        # le pirate signe avec SA clé
+        os.environ["TEXFORGE_SIGNING_KEY"] = str(base / "cle" / "cle_privee.txt")
+        pirate = next((base / "publication_pirate").iterdir())
+        saved_files = {r: (out / r).read_bytes() for r in (updater.RELEASE_FILE, updater.RELEASE_SIG, updater.RELEASE_KEY)}
+
+        def swap():
+            for r in saved_files:
+                shutil.copy2(pirate / r, out / r)
+
+        def unswap():
+            for r, b in saved_files.items():
+                (out / r).write_bytes(b)
+        attempt("dépôt piraté, re-signé avec une autre clé", swap, unswap, ("SIGNATURE INVALIDE", "INVALID SIGNATURE"))
+        sig = out / updater.RELEASE_SIG
+        attempt("dépôt piraté, version non signée", sig.unlink, lambda: sig.write_bytes(saved_files[updater.RELEASE_SIG]),
+                ("NON SIGNÉE", "NOT SIGNED"))
+
+        trap = out / "texforge" / "porte_derobee.py"
+        with FakeGitHub(out) as gh:
+            trap.write_text("raise SystemExit('code pirate exécuté')\n", encoding="utf-8")
+            (out / "sitecustomize.py").write_text("raise SystemExit('code pirate exécuté')\n", encoding="utf-8")
+            os.environ.update(gh.env())
+            res = updater.apply(updater.check())
+        _check(res["to"] == "99.1.0" and not (root / "texforge" / "porte_derobee.py").exists()
+               and not (root / "sitecustomize.py").exists() and updater.installed_version(root) == "99.1.0",
+               "version signée installée ; fichiers ajoutés hors de la liste signée ignorés (ni installés ni importés)",
+               failures)
+        updater.rollback(root)
+
+        plain_root = _project_copy(base / "installation_sans_cle", __version__)
+        plain_repo = _project_copy(base / "depot_sans_cle", "99.2.0")
+        req = plain_repo / "requirements.txt"
+        req.write_text(req.read_text(encoding="utf-8") + "--extra-index-url http://pirate.example/simple\n",
+                       encoding="utf-8")
+        updater.write_release(plain_repo)
+        os.environ["TEXFORGE_UPDATE_ROOT"] = str(plain_root)
+        before2 = _digest(plain_root)
+        try:
+            with FakeGitHub(plain_repo) as gh:
+                os.environ.update(gh.env())
+                updater.apply(updater.check())
+            ok_, why = False, "installée"
+        except updater.UpdateError as exc:
+            ok_, why = "extra-index-url" in str(exc), str(exc)
+        _check(ok_ and _digest(plain_root) == before2,
+               f"dépendance venue d'un autre index que PyPI : refusée ({why[:70]})", failures)
+
+        os.environ["TEXFORGE_UPDATE_API"] = "http://pirate.example/api"
+        _check(updater._base("API", "https://api.github.com") == "https://api.github.com",
+               "adresse de mise à jour détournée en HTTP : ignorée (HTTPS ou machine locale seulement)", failures)
+        real_max = updater.MAX_EXTRACTED
+        updater.MAX_EXTRACTED = 1000
+        try:
+            os.environ["TEXFORGE_UPDATE_ROOT"] = str(root)
+            with FakeGitHub(out) as gh:
+                os.environ.update(gh.env())
+                updater.apply(updater.check())
+            ok_ = False
+        except updater.UpdateError as exc:
+            ok_ = "anormale" in str(exc) or "abnormal" in str(exc)
+        finally:
+            updater.MAX_EXTRACTED = real_max
+        _check(ok_, "archive démesurée une fois décompressée (bombe) : refusée", failures)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+    # archives BA2 piégées (mods téléchargés) : refus propre, sans allouer des gigaoctets
+    from . import dds as _dds
+    img = Image.new("RGBA", (64, 64), (90, 120, 30, 255))
+    arc = base / "piege.ba2"
+    ba2.write_texture_archive(arc, [("Textures/Piege_d.DDS", _dds.encode_dds(img, "DXT1", 1))], version=7)
+    raw = bytearray(arc.read_bytes())
+    struct.pack_into("<I", raw, 24 + 24 + 12, 0xFFFFFFF0)              # taille du 1er morceau : 4 Go annoncés
+    arc.write_bytes(bytes(raw))
+    try:
+        with ba2.Ba2Archive(arc) as a:
+            a.read_dds(a.textures[0])
+        ok_ = False
+    except ba2.Ba2Error:
+        ok_ = True
+    bomb = base / "bombe.bin"
+    bomb.write_bytes(zlib.compress(b"\0" * 20_000_000))
+    a = ba2.Ba2Archive.__new__(ba2.Ba2Archive)
+    a.path, a.f, a.compression = bomb, open(bomb, "rb"), "zlib"
+    try:
+        a._unpack(ba2.Chunk(0, bomb.stat().st_size, 1000, 0, 0))
+        ok2 = False
+    except ba2.Ba2Error:
+        ok2 = True
+    finally:
+        a.f.close()
+    _check(ok_ and ok2 and ba2.safe_rel("Textures/../../Démarrage/x.exe") is None and ba2.safe_rel("C:/x") is None,
+           "BA2 piégée : taille démesurée et bombe zlib refusées, chemins sortants bloqués", failures)
+    page = render_page([{"id": "a", "name": "</script><script>alert(1)</script>", "status": "done", "mode": "ai",
+                         "choice": "auto", "fmt": "DXT1", "w": 1, "h": 1, "metrics": {}, "error": "<img src=x>",
+                         "imgs": {}}])
+    _check("</script><script>alert(1)" not in page, "galerie HTML : noms de textures piégés neutralisés", failures)
 
 
 def main() -> int:
@@ -1341,6 +1510,9 @@ def main() -> int:
 
         print("19. Prompt détaillé en anglais (aperçu)")
         _selftest_prompt(failures)
+
+        print("20. Sécurité : attaques simulées")
+        _selftest_security(tmp, failures)
     except Exception:
         traceback.print_exc()
         failures.append("exception")

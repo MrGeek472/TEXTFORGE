@@ -51,7 +51,7 @@ if importlib.util.find_spec("PySide6") is None:          # message clair plutôt
     raise SystemExit(1)
 
 from PySide6.QtCore import (QDateTime, QLibraryInfo, QLocale, QObject, QPointF, QRunnable, QSettings, Qt,  # noqa: E402
-                            QThread, QThreadPool, QTimer, QTranslator, QUrl, Signal, Slot)
+                            QStandardPaths, QThread, QThreadPool, QTimer, QTranslator, QUrl, Signal, Slot)
 from PySide6.QtGui import (QColor, QDesktopServices, QFont, QFontDatabase, QGuiApplication, QIcon,  # noqa: E402
                            QPainter, QPalette, QPixmap, QTextCursor)
 from PySide6.QtWidgets import (QAbstractItemView, QApplication, QCheckBox, QComboBox, QDialog,  # noqa: E402
@@ -332,6 +332,12 @@ def fmt_duration(s: float | None) -> str:
     if s < 3600:
         return f"{s // 60} min {s % 60:02d} s"
     return f"{s // 3600} h {(s % 3600) // 60:02d} min"
+
+
+def plain(text: object) -> str:
+    """Texte venu de l'extérieur (message de commit, nom de fichier d'un jeu) : sans balises, pour que les
+    boîtes de dialogue et infobulles de Qt (qui interprètent le HTML) l'affichent tel quel."""
+    return str(text).replace("<", "‹").replace(">", "›")
 
 
 def open_path(path: Path | str) -> None:
@@ -2395,7 +2401,7 @@ class MainWindow(QMainWindow):
         if r.get("available") and not r.get("restart"):
             if manual or self.qs.value("update_announced", "") != r.get("remote"):
                 self.console.add(tr("[MAJ] TEXFORGE {remote} disponible sur GitHub (installée : {local}) — bouton "
-                                    "« Mettre à jour » en haut à droite.", remote=r["remote"], local=r["local"])
+                                    "« Mettre à jour » en haut à droite.", remote=plain(r["remote"]), local=r["local"])
                                  + (f" {r['message']}" if r.get("message") else ""))
                 self.qs.setValue("update_announced", r.get("remote"))
         elif manual:
@@ -2424,12 +2430,12 @@ class MainWindow(QMainWindow):
                      "Redémarre l'application pour l'utiliser.", v=r.get("local", "?"), running=__version__)
         elif r.get("available"):
             state = "available"
-            text = tr("● {v} disponible", v=r["remote"])
+            text = tr("● {v} disponible", v=plain(r["remote"])[:20])
             when = (r.get("date") or "")[:10]
             tip = tr("TEXFORGE {remote} disponible sur GitHub ({repo}) — installée : {local}", remote=r["remote"],
                      repo=r.get("repo", ""), local=r.get("local", "?"))
             if r.get("message"):
-                tip += "\n" + tr("Dernier changement : {msg}", msg=r["message"]) + (f" ({when})" if when else "")
+                tip += "\n" + tr("Dernier changement : {msg}", msg=plain(r["message"])) + (f" ({when})" if when else "")
             if r.get("git"):
                 tip += "\n" + tr("Installation suivie par git : mets-la à jour avec « git pull ».")
             else:
@@ -2446,6 +2452,12 @@ class MainWindow(QMainWindow):
             tip = tr("TEXFORGE {local} est à jour (dépôt GitHub {repo}).", local=r.get("local"), repo=r.get("repo", ""))
         else:
             tip = tr("Mises à jour : vérification au démarrage…")
+        if r.get("remote") and not self._updating:
+            tip += "\n" + (tr("Mises à jour signées : seules les versions signées par ta clé ({fp}) sont acceptées.",
+                              fp=r.get("fingerprint", "")) if r.get("signed") else
+                           tr("Mises à jour NON signées : quiconque prendrait le contrôle du dépôt GitHub pourrait "
+                              "publier une version.\nClic sur la pastille → « Préparer une version signée » pour "
+                              "activer la signature."))
         if self._update_checked_at and not self._updating:
             tip += "\n" + tr("Dernière vérification : {t}", t=time.strftime("%H:%M", time.localtime(self._update_checked_at)))
         self.update_pill.setText(text)
@@ -2469,6 +2481,10 @@ class MainWindow(QMainWindow):
         auto.setCheckable(True)
         auto.setChecked(str(self.qs.value("update_auto", "true")).lower() in ("true", "1"))
         auto.toggled.connect(lambda on: self.qs.setValue("update_auto", bool(on)))
+        menu.addSeparator()
+        pub = menu.addAction(tr("Préparer une version signée à publier sur GitHub…"))
+        pub.setEnabled(self.worker is None and not self._updating)
+        pub.triggered.connect(self._publish_release)
         back = updater.last_backup()
         if back is not None:
             menu.addSeparator()
@@ -2476,6 +2492,38 @@ class MainWindow(QMainWindow):
             b.setEnabled(self.worker is None and not self._updating)
             b.triggered.connect(self._rollback_update)
         menu.exec(self.update_pill.mapToGlobal(self.update_pill.rect().bottomLeft()))
+
+    def _publish_release(self) -> None:
+        """Dossier prêt à envoyer sur GitHub, signé avec la clé de l'auteur (créée la première fois)."""
+        first = updater.read_key_file(updater.key_path()) is None
+        intro = tr("Prépare un dossier sur le Bureau avec exactement les fichiers de cette version, la liste de leurs "
+                   "empreintes et sa signature.\nEnvoie ensuite le CONTENU de ce dossier sur GitHub.")
+        if first:
+            intro += "\n\n" + tr("Première fois : une clé de signature est créée dans\n{path}\nNe la publie jamais, "
+                                  "sauvegarde-la hors de ce PC (clé USB). Dès que ce dossier est publié, tes "
+                                  "installations n'accepteront plus que les versions signées avec cette clé.",
+                                  path=updater.key_path())
+        if QMessageBox.question(self, APP_NAME, intro) != QMessageBox.Yes:
+            return
+        desk = QStandardPaths.writableLocation(QStandardPaths.DesktopLocation)
+        parent = Path(desk) if desk and Path(desk).is_dir() else None
+
+        def done(res: dict) -> None:
+            if "error" in res:
+                err = re.sub(r"^\w*Error: ", "", str(res["error"]))
+                self.console.add(tr("[PUBLICATION] ✗ {err}", err=err))
+                QMessageBox.warning(self, APP_NAME, plain(err))
+                return
+            self.console.add(tr("[PUBLICATION] TEXFORGE {v} signée (clé {fp}) : {n} fichiers dans {dest}",
+                                v=res["version"], fp=res["fingerprint"], n=res["files"], dest=res["dest"]))
+            text = tr("Dossier prêt : {dest}\n\nEnvoie son CONTENU sur GitHub (Add file → Upload files, glisse tous "
+                      "les fichiers et dossiers).\nEmpreinte de ta clé : {fp}", dest=res["dest"], fp=res["fingerprint"])
+            if res["created"]:
+                text += "\n\n" + tr("Clé privée créée : {key}\nSauvegarde-la maintenant hors de ce PC.", key=res["key"])
+            QMessageBox.information(self, APP_NAME, text)
+            open_path(res["dest"])
+            self.check_updates()
+        self._run_task(lambda: updater.publish(parent), done)
 
     def _on_update_clicked(self) -> None:
         r = self.update_info or {}
@@ -2485,9 +2533,12 @@ class MainWindow(QMainWindow):
         if not r.get("available") or self._updating or self.worker is not None:
             return
         msg = tr("Installer TEXFORGE {remote} depuis GitHub ({repo}) ?\n\nVersion installée : {local}.",
-                 remote=r["remote"], repo=r.get("repo", ""), local=r.get("local", "?"))
+                 remote=plain(r["remote"]), repo=r.get("repo", ""), local=r.get("local", "?"))
+        msg += "\n" + (tr("Signature exigée : la version sera refusée si elle n'est pas signée par ta clé ({fp}).",
+                          fp=r.get("fingerprint", "")) if r.get("signed") else
+                       tr("Attention : mises à jour non signées (aucune clé dans cette installation)."))
         if r.get("message"):
-            msg += "\n" + tr("Dernier changement : {msg}", msg=r["message"])
+            msg += "\n" + tr("Dernier changement : {msg}", msg=plain(r["message"]))
         msg += "\n\n" + tr("La nouvelle version est téléchargée puis contrôlée avant toute écriture ; les fichiers "
                             "remplacés sont sauvegardés (retour arrière possible depuis la pastille). L'application "
                             "redémarre ensuite.")
@@ -2516,7 +2567,7 @@ class MainWindow(QMainWindow):
                 err = re.sub(r"^\w*Error: ", "", str(res["error"]))
                 self.console.add(tr("[MAJ] ✗ mise à jour impossible : {err}", err=err))
                 self._paint_update()
-                QMessageBox.warning(self, APP_NAME, tr("Mise à jour impossible :\n\n{err}", err=err))
+                QMessageBox.warning(self, APP_NAME, tr("Mise à jour impossible :\n\n{err}", err=plain(err)))
                 return
             self.update_info = {**self.update_info, "local": res["to"], "restart": True, "available": False}
             _ACTIVE["update"] = (time.time(), dict(self.update_info))

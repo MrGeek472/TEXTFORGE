@@ -114,6 +114,10 @@ def texture_count(path: str | Path) -> int:
     return count if kind == "DX10" else 0
 
 
+MAX_ENTRIES = 1_000_000          # Fallout 4 : quelques dizaines de milliers par archive
+MAX_CHUNK = 512 * 2 ** 20        # un niveau de mip 16384² en BC7 fait 256 Mo
+
+
 class Ba2Archive:
     """Archive ouverte en lecture. `textures` : textures 2D et cubemaps d'une archive DX10."""
 
@@ -145,6 +149,8 @@ class Ba2Archive:
         if len(head) < 24 or head[:4] != MAGIC:
             raise Ba2Error(tr("pas une archive BA2 : {path}", path=self.path.name))
         self.version, kind, count, names_at = struct.unpack_from("<I4sIQ", head, 4)
+        if count > MAX_ENTRIES:                       # archive piégée : index démesuré
+            raise Ba2Error(tr("archive BA2 corrompue ({name})", name=self.path.name))
         self.kind = kind.decode("ascii", "replace")
         if self.version not in VERSIONS:
             raise Ba2Error(tr("version BA2 {v} inconnue ({name})", v=self.version, name=self.path.name))
@@ -203,6 +209,9 @@ class Ba2Archive:
 
     # ------------------------------------------------------------ données
     def _unpack(self, c: Chunk) -> bytes:
+        if c.size > MAX_CHUNK or c.packed > MAX_CHUNK:
+            # tailles annoncées démesurées (archive piégée) : refus avant toute allocation
+            raise Ba2Error(tr("morceau démesuré dans {name}", name=self.path.name))
         self.f.seek(c.offset)
         if not c.packed:
             data = self.f.read(c.size)
@@ -216,7 +225,8 @@ class Ba2Archive:
                                       "(pip install lz4)")) from exc
                 data = lz4.block.decompress(raw, uncompressed_size=c.size)
             elif self.compression == "zlib":
-                data = zlib.decompress(raw)
+                d = zlib.decompressobj()
+                data = d.decompress(raw, c.size + 1)       # jamais plus que la taille annoncée (bombe zlib)
             else:
                 raise Ba2Error(tr("compression BA2 {method} non gérée ({name})", method=self.compression,
                                   name=self.path.name))

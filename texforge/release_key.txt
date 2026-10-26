@@ -1,0 +1,3 @@
+# Clé publique de signature des versions TEXFORGE (Ed25519). Une mise à jour qui n'est pas
+# signée par la clé privée correspondante est refusée.
+72b05e6d5ff64d1c80093bbe681eb8a094e4bae5cba4087594db210ebac92dcc
