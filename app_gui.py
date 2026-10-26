@@ -334,6 +334,14 @@ def fmt_duration(s: float | None) -> str:
     return f"{s // 3600} h {(s % 3600) // 60:02d} min"
 
 
+def nbsp(text: str) -> str:
+    """Espaces insécables avant : ; ? ! » et après « : jamais de ligne qui commence par une ponctuation."""
+    for a, b in ((" :", "\u00a0:"), (" ;", "\u00a0;"), (" ?", "\u00a0?"), (" !", "\u00a0!"), (" »", "\u00a0»"),
+                 ("« ", "«\u00a0")):
+        text = text.replace(a, b)
+    return text
+
+
 def plain(text: object) -> str:
     """Texte venu de l'extérieur (message de commit, nom de fichier d'un jeu) : sans balises, pour que les
     boîtes de dialogue et infobulles de Qt (qui interprètent le HTML) l'affichent tel quel."""
@@ -537,6 +545,20 @@ class PathRow(QWidget):
 
     def setText(self, t: str) -> None:
         self.edit.setText(t)
+
+
+class HintLabel(QLabel):
+    """Texte d'aide replié sur plusieurs lignes, en texte brut, sans ponctuation en début de ligne."""
+
+    def __init__(self, text: str = "", object_name: str = "hint") -> None:
+        super().__init__()
+        self.setObjectName(object_name)
+        self.setWordWrap(True)
+        self.setTextFormat(Qt.PlainText)
+        self.setText(text)
+
+    def setText(self, text: str) -> None:  # noqa: N802 (API Qt)
+        super().setText(nbsp(text))
 
 
 class ValueSlider(QWidget):
@@ -1047,14 +1069,16 @@ class MainWindow(QMainWindow):
         lay.setContentsMargins(0, 0, 6, 0)
         lay.setSpacing(10)
         lay.addWidget(self._group_engine())
-        lay.addWidget(self._group_generation())
+        lay.addWidget(self._group_render())
+        lay.addWidget(self._group_intensity())
+        lay.addWidget(self._group_output())
         lay.addWidget(self._group_dds())
         lay.addWidget(self._group_options())
         lay.addStretch(1)
         scroll = QScrollArea()
         scroll.setWidget(inner)
         scroll.setWidgetResizable(True)
-        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)    # filet : jamais de réglage coupé sans le voir
         for combo in inner.findChildren(QComboBox):          # un libellé long ne doit pas élargir la colonne
             combo.setSizeAdjustPolicy(QComboBox.AdjustToMinimumContentsLengthWithIcon)
             combo.setMinimumContentsLength(14)
@@ -1136,10 +1160,18 @@ class MainWindow(QMainWindow):
         self.engine_box = box
         return box
 
-    def _group_generation(self) -> QGroupBox:
-        box = QGroupBox(tr("PHOTORÉALISME / FIDÉLITÉ À LA DA"))
+    @staticmethod
+    def _form(box: QGroupBox) -> QFormLayout:
         form = QFormLayout(box)
         form.setLabelAlignment(Qt.AlignRight)
+        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
+        return form
+
+    def _group_render(self) -> QGroupBox:
+        """Rendu et prompt : ce que l'IA doit produire."""
+        box = QGroupBox(tr("RENDU && PROMPT"))
+        form = self._form(box)
         self.style = QComboBox()
         for key, label in STYLES:
             self.style.addItem(tr(label), key)
@@ -1176,18 +1208,22 @@ class MainWindow(QMainWindow):
         self.subject.textChanged.connect(
             lambda: self.btn_enhance.setEnabled(bool(self.subject.toPlainText().strip())))
         self.btn_enhance.setEnabled(False)
-        prow = QHBoxLayout()
-        prow.setContentsMargins(0, 0, 0, 0)
-        prow.addWidget(self.prompt_only)
-        prow.addStretch(1)
-        prow.addWidget(self.btn_enhance)
-        form.addRow("", prow)
-        self.prompt_preview = QLabel()
-        self.prompt_preview.setObjectName("hint")
-        self.prompt_preview.setWordWrap(True)
+        brow = QHBoxLayout()
+        brow.setContentsMargins(0, 0, 0, 0)
+        brow.addWidget(self.btn_enhance)
+        brow.addStretch(1)
+        form.addRow("", brow)
+        form.addRow("", self.prompt_only)
+        self.prompt_preview = HintLabel()
         self.prompt_preview.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        self.prompt_preview.setTextFormat(Qt.PlainText)
-        form.addRow("", self.prompt_preview)
+        form.addRow(self.prompt_preview)               # aperçu sur toute la largeur : moins de lignes
+        self.render_box = box
+        return box
+
+    def _group_intensity(self) -> QGroupBox:
+        """Intensité de l'IA : ce qui est réinventé, ce qui est tenu."""
+        box = QGroupBox(tr("INTENSITÉ DE L'IA"))
+        form = self._form(box)
         self.denoise = ValueSlider(0.20, 1.00, 0.01, 0.42)
         self.denoise.setToolTip(tr("Part de l'image réinventée par le modèle. Bas : fidèle à l'original ;\n"
                                    "haut : plus de matière et de détail, plus de risque de trahir la DA.\n"
@@ -1216,16 +1252,21 @@ class MainWindow(QMainWindow):
                                         "Décoché : la même valeur pour toutes les textures."))
         self.per_material.toggled.connect(lambda _c: self._update_presets())
         form.addRow("", self.per_material)
-        self.presets_label = QLabel()
-        self.presets_label.setObjectName("hint")
-        self.presets_label.setWordWrap(True)
-        form.addRow("", self.presets_label)
-        self.style_warn = QLabel(tr("⚠ Au-delà de 0,6 en rendu Fidèle, le contrôle qualité rejettera la plupart des "
-                                    "résultats (version locale gardée) : choisis « Photoréaliste créatif »."))
-        self.style_warn.setWordWrap(True)
+        self.presets_label = HintLabel()
+        form.addRow(self.presets_label)
+        self.style_warn = HintLabel(tr("⚠ Au-delà de 0,6 en rendu Fidèle, le contrôle qualité rejettera la plupart "
+                                       "des résultats (version locale gardée) : choisis « Photoréaliste créatif »."),
+                                    object_name="")
         self.style_warn.setStyleSheet(f"color: {C['yellow']};")
         self.style_warn.setVisible(False)
-        form.addRow("", self.style_warn)
+        form.addRow(self.style_warn)
+        self.intensity_form = form
+        return box
+
+    def _group_output(self) -> QGroupBox:
+        """Taille des textures produites et lot d'essai."""
+        box = QGroupBox(tr("TAILLE DE SORTIE"))
+        form = self._form(box)
         row = QHBoxLayout()
         self.scale = QComboBox()
         self.scale.addItem("×2", 2)
@@ -1752,11 +1793,14 @@ class MainWindow(QMainWindow):
             top = AUTO_DENOISE.get(self.style.currentData(), (None,))[0]
             if top is not None and abs(self.denoise.value() - top) > 1e-6:
                 self.denoise.setValue(top)
-        self.denoise.setEnabled(not esrgan and not auto)
-        self.auto_denoise.setEnabled(not esrgan)
-        self.per_material.setEnabled(not esrgan and self.style.currentData() != "photoreal")   # sans objet en photo
-        self.cn.setEnabled(not esrgan)
-        self.esrgan_detail.setEnabled(esrgan)
+        self.denoise.setEnabled(not auto)
+        # réglages sans objet masqués plutôt que grisés : Real-ESRGAN n'a ni prompt, ni denoise, ni ControlNet
+        self.render_box.setVisible(not esrgan)
+        form = self.intensity_form
+        for w in (self.denoise, self.auto_denoise, self.cn, self.presets_label):
+            form.setRowVisible(w, not esrgan)
+        form.setRowVisible(self.esrgan_detail, esrgan)
+        form.setRowVisible(self.per_material, not esrgan and self.style.currentData() != "photoreal")
         self._update_esrgan_status()
         if getattr(self, "chips", None) and self.worker is None:
             self.chips["ai"].setProperty("label", "ESRGAN" if esrgan else "COMFYUI")

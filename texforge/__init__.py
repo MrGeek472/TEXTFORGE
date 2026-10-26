@@ -4,4 +4,4 @@ Pipeline hors-ligne et local : textures extraites -> routage (UI / ComfyUI / loc
 -> validation -> revue -> contrôle qualité final -> DDS avec mipmaps (Special K), PNG ou RTX Remix.
 """
 
-__version__ = "0.5.8"
+__version__ = "0.5.9"

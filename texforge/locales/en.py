@@ -91,7 +91,9 @@ MESSAGES: dict[str, str] = {
         "LoRA inserted after the checkpoint (photorealism, material…). The node is added\n"
         "to the workflow automatically; circular tiling stays active.",
     "Force LoRA": "LoRA strength",
-    "PHOTORÉALISME / FIDÉLITÉ À LA DA": "PHOTOREALISM / ART DIRECTION FIDELITY",
+    "RENDU && PROMPT": "RENDERING && PROMPT",
+    "INTENSITÉ DE L'IA": "AI STRENGTH",
+    "TAILLE DE SORTIE": "OUTPUT SIZE",
     "Force du ControlNet Tile : attache le rendu aux formes et aux couleurs de l'original.":
         "ControlNet Tile strength: ties the render to the shapes and colors of the original.",
     "Ajuster par matériau": "Adjust per material",
