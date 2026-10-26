@@ -92,9 +92,6 @@ MESSAGES: dict[str, str] = {
         "to the workflow automatically; circular tiling stays active.",
     "Force LoRA": "LoRA strength",
     "PHOTORÉALISME / FIDÉLITÉ À LA DA": "PHOTOREALISM / ART DIRECTION FIDELITY",
-    "Part de l'image réinventée par le modèle. Bas : fidèle à l'original ;\nhaut : plus de matière et de détail, plus de risque de trahir la DA.":
-        "Share of the image reinvented by the model. Low: faithful to the original;\n"
-        "high: more material and detail, more risk of betraying the art direction.",
     "Force du ControlNet Tile : attache le rendu aux formes et aux couleurs de l'original.":
         "ControlNet Tile strength: ties the render to the shapes and colors of the original.",
     "Ajuster par matériau": "Adjust per material",
@@ -1062,6 +1059,44 @@ MESSAGES: dict[str, str] = {
         '[INFO] ⚠ Real-ESRGAN not found: tiles will start from a blurry Lanczos upscale and the AI will add little detail. Use "Install Real-ESRGAN".',
     '[INFO] Real-ESRGAN réglé introuvable ({old}) : {new} utilisé.':
         '[INFO] Configured Real-ESRGAN not found ({old}): {new} used.',
+    'Fidèle — textures de jeu, DA conservée':
+        'Faithful — game textures, art direction kept',
+    'Photoréaliste créatif — invente du détail':
+        'Creative photoreal — invents detail',
+    "Fidèle : textures de jeu, la DA et les formes sont conservées, le contrôle qualité rejette ce qui s'en écarte.\nPhotoréaliste créatif : le modèle voit l'image entière, invente matière et détail (denoise jusqu'à 1),\npuis affine morceau par morceau ; le contrôle qualité ne garde qu'un garde-fou.":
+        'Faithful: game textures, art direction and shapes are kept, quality control rejects what drifts.\nCreative photoreal: the model sees the whole image, invents material and detail (denoise up to 1),\nthen refines tile by tile; quality control only keeps a safety net.',
+    'Rendu':
+        'Rendering',
+    "Part de l'image réinventée par le modèle. Bas : fidèle à l'original ;\nhaut : plus de matière et de détail, plus de risque de trahir la DA.\nAu-delà de 0,6 : rendu « Photoréaliste créatif » conseillé.":
+        'Share of the image reinvented by the model. Low: faithful to the original;\nhigh: more material and detail, more risk of betraying the art direction.\nAbove 0.6: "Creative photoreal" rendering recommended.',
+    '⚠ Au-delà de 0,6 en rendu Fidèle, le contrôle qualité rejettera la plupart des résultats (version locale gardée) : choisis « Photoréaliste créatif ».':
+        '⚠ Above 0.6 in Faithful rendering, quality control will reject most results (local version kept): choose "Creative photoreal".',
+    "passe globale : denoise {d:.2f} sur l'image entière, puis affinage par morceaux à {r:.2f} ; ControlNet Tile {c:.2f}":
+        'global pass: denoise {d:.2f} on the whole image, then tile refinement at {r:.2f}; Tile ControlNet {c:.2f}',
+    '{stem} : passe globale':
+        '{stem}: global pass',
+    'rendu inconnu : {style}':
+        'unknown rendering: {style}',
+    'Denoise auto (maximum)':
+        'Auto denoise (maximum)',
+    "Fidèle : part de 0,60, le plus fort denoise qui garde d'ordinaire la texture intacte, et redescend\n(0,49 puis 0,41) seulement si la validation voit la texture transformée.\nPhotoréaliste créatif : part de 1,00 (puis 0,85 et 0,70 si le garde-fou échoue).":
+        'Faithful: starts at 0.60, the strongest denoise that usually keeps the texture intact, and steps down\n(0.49 then 0.41) only if validation sees the texture transformed.\nCreative photoreal: starts at 1.00 (then 0.85 and 0.70 if the safety net fails).',
+    '(si refus : {steps})':
+        '(if rejected: {steps})',
+    '{stem} : essai du denoise {d:.2f}':
+        '{stem}: trying denoise {d:.2f}',
+    "Décris le résultat voulu plutôt qu'une consigne, en anglais de préférence.\nEx. : green futuristic armor, scratched metal plates, worn paint, gold reflective visor":
+        'Describe the result you want rather than an instruction, preferably in English.\nE.g.: green futuristic armor, scratched metal plates, worn paint, gold reflective visor',
+    "Ajouté au prompt de chaque texture du lancement. Le modèle génère une image qui correspond à une description :\n« rusty scratched metal » marche mieux que « ajoute de la rouille ». SDXL comprend surtout l'anglais ;\nZ-Image comprend aussi le français. Une règle par texture ([[rules]] hint) s'y ajoute.":
+        'Added to the prompt of every texture in the run. The model generates an image that matches a description:\n"rusty scratched metal" works better than "add rust". SDXL mostly understands English;\nZ-Image also understands French. A per-texture rule ([[rules]] hint) is added to it.',
+    'Prompt à donner':
+        'Prompt to give',
+    'Prompt seul, sans ajouts':
+        'Prompt alone, no additions',
+    "Décoché : TEXFORGE l'entoure de son préfixe, du prompt du matériau détecté (rendu Fidèle)\net de son suffixe. Coché : seul ton texte part, tu as la main sur tout.":
+        'Unchecked: TEXFORGE wraps it with its prefix, the detected material prompt (Faithful rendering)\nand its suffix. Checked: only your text is sent, you control everything.',
+    'Prompt envoyé (texture générique) : {p}':
+        'Prompt sent (generic texture): {p}',
     'nœud ColorTransfer absent : couleurs recalées par TEXFORGE après la génération.':
         'ColorTransfer node missing: colours realigned by TEXFORGE after generation.',
     'nœud OffsetImage absent : aperçu du raccord dans ComfyUI désactivé (sans effet sur le résultat).':
@@ -1070,4 +1105,196 @@ MESSAGES: dict[str, str] = {
         'Tile+Canny workflow disabled, missing nodes: {nodes}; every material goes through the Tile workflow.',
     "[INFO] {n} texture(s) d'un scan précédent introuvable(s) (fichier supprimé ou renommé) : mise(s) de côté":
         '[INFO] {n} texture(s) from a previous scan not found (file deleted or renamed): set aside',
+    "Durée du lancement entier (analyse, génération, contrôle qualité et export).\nCalculée sur le nombre de passages ComfyUI et la taille des textures, puis recalée sur le temps réellement mis par les textures déjà terminées.\nLes durées mesurées sont mémorisées : l'estimation du lancement suivant sur ce PC part d'elles.":
+        'Duration of the whole run (scan, generation, quality control and export).\nComputed from the number of ComfyUI passes and the size of the textures, then readjusted to the time the textures already finished actually took.\nMeasured durations are remembered: the estimate of the next run on this PC starts from them.',
+    "Durée totale estimée : calculée à la fin de l'analyse des textures":
+        'Estimated total duration: computed once the textures are scanned',
+    'Durée totale estimée ~{total} · reste ~{rest} · fin vers {when}':
+        'Estimated total duration ~{total} · ~{rest} left · ends around {when}',
+    'Durée réelle {real} — estimation de départ ~{first}':
+        'Actual duration {real} — initial estimate ~{first}',
+    '{d} j {h} h':
+        '{d} d {h} h',
+    '{s} s':
+        '{s} s',
+    '{m} min':
+        '{m} min',
+    '{h} h {m:02d}':
+        '{h} h {m:02d}',
+    ' — recalée pendant le traitement':
+        ' — readjusted during processing',
+    'mesuré sur ce PC':
+        'measured on this PC',
+    'valeur indicative, mesurée pendant ce lancement':
+        'rough default, measured during this run',
+    'génération ~{gen} : {passes} passage(s) ComfyUI × ~{per} s ({src})':
+        'generation ~{gen}: {passes} ComfyUI pass(es) × ~{per} s ({src})',
+    'contrôle qualité et export ~{t} ({n} texture(s), {mp} Mpx)':
+        'quality control and export ~{t} ({n} texture(s), {mp} MP)',
+    '[ESTIMATION] ≈ {total} au total':
+        '[ESTIMATE] ≈ {total} in total',
+    'génération ~{gen}':
+        'generation ~{gen}',
+    '[ESTIMATION] indisponible : {exc}':
+        '[ESTIMATE] unavailable: {exc}',
+    'Installer TEXFORGE {remote} depuis GitHub ({repo}) ?\n\nVersion installée : {local}.':
+        'Install TEXFORGE {remote} from GitHub ({repo})?\n\nInstalled version: {local}.',
+    '⬇ Mettre à jour':
+        '⬇ Update',
+    'Mises à jour : vérification au démarrage…':
+        'Updates: checking at startup…',
+    'Installation de TEXFORGE {remote} en cours…':
+        'Installing TEXFORGE {remote}…',
+    'Vérifier maintenant':
+        'Check now',
+    'Ouvrir le dépôt sur GitHub ({repo})':
+        'Open the repository on GitHub ({repo})',
+    'Vérifier automatiquement (démarrage, puis toutes les 30 min)':
+        'Check automatically (at startup, then every 30 min)',
+    "La nouvelle version est téléchargée puis contrôlée avant toute écriture ; les fichiers remplacés sont sauvegardés (retour arrière possible depuis la pastille). L'application redémarre ensuite.":
+        'The new version is downloaded and checked before anything is written; replaced files are backed up (roll back from the badge). The application then restarts.',
+    'vérification impossible : {why}':
+        'check failed: {why}',
+    '● installation…':
+        '● installing…',
+    '● {v} installée':
+        '● {v} installed',
+    "TEXFORGE {v} est installée sur le disque ; la version {running} tourne encore.\nRedémarre l'application pour l'utiliser.":
+        'TEXFORGE {v} is installed on disk; version {running} is still running.\nRestart the application to use it.',
+    'Dernière vérification : {t}':
+        'Last check: {t}',
+    'Clic : vérifier maintenant, dépôt GitHub, retour arrière.':
+        'Click: check now, GitHub repository, roll back.',
+    'Possible après le traitement en cours.':
+        'Available once the current run is over.',
+    'Revenir à la version {v} (avant la dernière mise à jour)':
+        'Go back to version {v} (before the last update)',
+    'Dernier changement : {msg}':
+        'Latest change: {msg}',
+    "[MAJ] TEXFORGE {to} installée ({n} fichier(s) remplacé(s), {a} ajouté(s)) — redémarre l'application pour l'utiliser.":
+        '[UPDATE] TEXFORGE {to} installed ({n} file(s) replaced, {a} added) — restart the application to use it.',
+    "Revenir à TEXFORGE {v} ?\n\nLes fichiers d'avant la dernière mise à jour ({to}) sont remis en place, puis l'application redémarre.":
+        'Go back to TEXFORGE {v}?\n\nThe files from before the last update ({to}) are put back, then the application restarts.',
+    '[MAJ] Retour à TEXFORGE {to} : {n} fichier(s) restauré(s), {a} retiré(s).':
+        '[UPDATE] Back to TEXFORGE {to}: {n} file(s) restored, {a} removed.',
+    'Redémarrage possible après le traitement en cours.':
+        'Restart possible once the current run is over.',
+    '↻ Redémarrer':
+        '↻ Restart',
+    '● {v} disponible':
+        '● {v} available',
+    'TEXFORGE {remote} disponible sur GitHub ({repo}) — installée : {local}':
+        'TEXFORGE {remote} available on GitHub ({repo}) — installed: {local}',
+    '[MAJ] ✗ mise à jour impossible : {err}':
+        '[UPDATE] ✗ update failed: {err}',
+    'Mise à jour impossible :\n\n{err}':
+        'Update failed:\n\n{err}',
+    'TEXFORGE {to} est installée.\n\nRedémarrer maintenant ?':
+        'TEXFORGE {to} is installed.\n\nRestart now?',
+    '[MAJ] ✗ retour arrière impossible : {err}':
+        '[UPDATE] ✗ rollback failed: {err}',
+    'Retour arrière impossible :\n\n{err}':
+        'Rollback failed:\n\n{err}',
+    'Redémarrage impossible : {err}\nRelance TEXFORGE à la main.':
+        'Restart failed: {err}\nStart TEXFORGE again by hand.',
+    '[MAJ] TEXFORGE {remote} disponible sur GitHub (installée : {local}) — bouton « Mettre à jour » en haut à droite.':
+        '[UPDATE] TEXFORGE {remote} available on GitHub (installed: {local}) — "Update" button at the top right.',
+    "Recherche d'une mise à jour sur GitHub…":
+        'Looking for an update on GitHub…',
+    '● téléchargement {pct} %':
+        '● downloading {pct} %',
+    '● téléchargement {mb:.1f} Mo':
+        '● downloading {mb:.1f} MB',
+    'TEXFORGE {to} est remise en place.\n\nRedémarrer maintenant ?':
+        'TEXFORGE {to} is back in place.\n\nRestart now?',
+    '[MAJ] TEXFORGE {local} : plus récente que la version du dépôt GitHub ({remote}), rien à installer.':
+        '[UPDATE] TEXFORGE {local}: newer than the GitHub repository version ({remote}), nothing to install.',
+    '[MAJ] TEXFORGE {local} est à jour (dépôt GitHub : {remote}).':
+        '[UPDATE] TEXFORGE {local} is up to date (GitHub repository: {remote}).',
+    'Installation suivie par git : mets-la à jour avec « git pull ».':
+        'Install tracked by git: update it with "git pull".',
+    '{err}\nNouvel essai automatique dans 30 min ; clic sur la pastille pour réessayer.':
+        '{err}\nAutomatic retry in 30 min; click the badge to try again.',
+    'TEXFORGE {local} : plus récente que la version du dépôt GitHub ({remote}).\nRien à installer ; publie-la sur GitHub pour que les autres installations la reçoivent.':
+        'TEXFORGE {local}: newer than the GitHub repository version ({remote}).\nNothing to install; publish it on GitHub so other installs receive it.',
+    'TEXFORGE {local} est à jour (dépôt GitHub {repo}).':
+        'TEXFORGE {local} is up to date (GitHub repository {repo}).',
+    'Version installée : {local} — dépôt {repo} : {remote}':
+        'Installed version: {local} — repository {repo}: {remote}',
+    "TEXFORGE {to} installé : relance l'application (retour arrière : texforge update --rollback).":
+        'TEXFORGE {to} installed: restart the application (roll back: texforge update --rollback).',
+    'Retour à TEXFORGE {to} : {n} fichier(s) restauré(s), {a} retiré(s).':
+        'Back to TEXFORGE {to}: {n} file(s) restored, {a} removed.',
+    'Mise à jour disponible : {remote}':
+        'Update available: {remote}',
+    'Version installée plus récente que le dépôt : rien à installer.':
+        'Installed version newer than the repository: nothing to install.',
+    'Aucune mise à jour.':
+        'No update.',
+    '  téléchargé : {mb:.1f} Mo':
+        '  downloaded: {mb:.1f} MB',
+    'Installer la version {remote} ? [o/N] ':
+        'Install version {remote}? [y/N] ',
+    'version introuvable dans le dépôt {repo}':
+        'version not found in repository {repo}',
+    '[MAJ] Dépendances à jour.':
+        '[UPDATE] Dependencies up to date.',
+    '[MAJ] {n} fichier(s) remplacé(s), {a} ajouté(s), {u} identique(s) ; originaux sauvegardés dans {path}':
+        '[UPDATE] {n} file(s) replaced, {a} added, {u} identical; originals backed up in {path}',
+    'GitHub limite les requêtes, nouvel essai plus tard':
+        'GitHub is rate-limiting requests, will retry later',
+    'dépôt {repo} introuvable ou privé':
+        'repository {repo} not found or private',
+    'archive du dépôt vide':
+        'repository archive is empty',
+    "dépôt incomplet, fichier(s) absent(s) : {files} — rien n'a été modifié":
+        'incomplete repository, missing file(s): {files} — nothing was changed',
+    "l'archive contient la version {got} au lieu de {want} — rien n'a été modifié":
+        'the archive contains version {got} instead of {want} — nothing was changed',
+    "dépôt incomplet, module(s) absent(s) : {list} — rien n'a été modifié. Publie tous les fichiers de la version sur GitHub.":
+        'incomplete repository, missing module(s): {list} — nothing was changed. Publish every file of the version on GitHub.',
+    'installation des dépendances impossible (pip, code {code}) : {tail}\nÀ lancer à la main : {cmd}':
+        'could not install dependencies (pip, code {code}): {tail}\nRun by hand: {cmd}',
+    "la nouvelle version ne démarre pas (import d'essai) : {err} — rien n'a été modifié":
+        'the new version does not start (test import): {err} — nothing was changed',
+    'installation suivie par git ({root}) : mets-la à jour avec « git pull »':
+        'install tracked by git ({root}): update it with "git pull"',
+    'aucune version plus récente à installer (installée {local}, dépôt {remote})':
+        'no newer version to install (installed {local}, repository {remote})',
+    '[MAJ] Téléchargement de TEXFORGE {v} depuis GitHub ({repo})…':
+        '[UPDATE] Downloading TEXFORGE {v} from GitHub ({repo})…',
+    '[MAJ] Contrôle de la nouvelle version ({n} fichiers)…':
+        '[UPDATE] Checking the new version ({n} files)…',
+    "[MAJ] Import d'essai de la nouvelle version…":
+        '[UPDATE] Test import of the new version…',
+    'aucune sauvegarde de mise à jour à restaurer':
+        'no update backup to restore',
+    "la version installée ({cur}) n'est plus celle de la dernière mise à jour ({to}) : retour arrière annulé":
+        'the installed version ({cur}) is no longer the one from the last update ({to}): rollback cancelled',
+    'téléchargement impossible : {why}':
+        'download failed: {why}',
+    'archive du dépôt illisible : {err}':
+        'unreadable repository archive: {err}',
+    'installation des dépendances impossible : {err}':
+        'could not install dependencies: {err}',
+    "import d'essai impossible : {err} — rien n'a été modifié":
+        'test import failed: {err} — nothing was changed',
+    "écriture impossible ({err}) : fichiers d'origine restaurés":
+        'write failed ({err}): original files restored',
+    '[MAJ] Dépendances modifiées : installation avec pip…':
+        '[UPDATE] Dependencies changed: installing with pip…',
+    'restauration incomplète : {err} (sauvegarde dans {path})':
+        'incomplete restore: {err} (backup in {path})',
+    "chemin refusé dans l'archive : {name}":
+        'path refused in the archive: {name}',
+    "{path} existe déjà et n'est pas un fichier : rien n'a été modifié":
+        '{path} already exists and is not a file: nothing was changed',
+    'archive du dépôt trop grosse (plus de {mb} Mo) : mise à jour annulée':
+        'repository archive too large (over {mb} MB): update cancelled',
+    "erreur de syntaxe dans {file} (ligne {line}) : version du dépôt cassée, rien n'a été modifié":
+        'syntax error in {file} (line {line}): repository version is broken, nothing was changed',
+    'importé par {file}':
+        'imported by {file}',
+    'écriture impossible ({err}) et restauration incomplète ({err2}) : sauvegarde dans {path}':
+        'write failed ({err}) and incomplete restore ({err2}): backup in {path}',
 }

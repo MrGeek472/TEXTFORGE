@@ -87,7 +87,7 @@ class Orchestrator:
 
     # ------------------------------------------------------------------ exécution
     def run(self, *, only: str | None = None, limit: int | None = None, stages: tuple[str, ...] = STAGES,
-            redo_stale: bool = False) -> dict:
+            redo_stale: bool = False, export_estimate: bool = False) -> dict:
         t0 = time.monotonic()
         if self.stop_file.exists():
             self.stop_file.unlink()
@@ -108,6 +108,13 @@ class Orchestrator:
             if r["mode"] in by_mode:
                 by_mode[r["mode"]].append(r)
         ai_rows = by_mode["ai"][:limit] if limit is not None else by_mode["ai"]
+        for r in ai_rows:
+            # texture à refaire avec d'autres réglages : essais remis à zéro. Sans cela, chaque changement de
+            # réglage consommait un essai (denoise automatique parti d'un palier plus bas) et, au 3e, la texture
+            # passait directement en agrandissement simple (« aucun résultat ») sans être envoyée à l'IA.
+            if int(r.get("attempts") or 0) and r.get("fingerprint") != self.runner.fp:
+                self.state.update(r["id"], attempts=0)
+                r["attempts"] = 0
         total = len(by_mode["ui"]) * ("ui" in stages) + len(by_mode["upscale"]) * ("local" in stages) + \
             len(ai_rows) * ("ai" in stages)
         if total == 0:
@@ -117,6 +124,8 @@ class Orchestrator:
                                                 "lors d'un lancement précédent, exportée(s) telles quelles", n=done))
         self.ev.emit("run_start", total=total, provider=self.provider_name, ui=len(by_mode["ui"]),
                      local=len(by_mode["upscale"]), ai=len(ai_rows))
+        if total or export_estimate:
+            self._estimate(by_mode, ai_rows, stages, export_estimate)
         try:
             if "ui" in stages and not self.stop_requested():
                 self._stage_ui(by_mode["ui"])
@@ -239,6 +248,8 @@ class Orchestrator:
                     self.ev.emit("info", message=f"[COMFYUI] ⚠ {note}")
                 if hasattr(self.provider, "on_note"):      # remarques apparues en cours de lot
                     self.provider.on_note = lambda note: self.ev.emit("info", message=f"[COMFYUI] ⚠ {note}")
+                if hasattr(self.provider, "on_pass"):      # estimation du temps : passages réellement faits
+                    self.provider.on_pass = getattr(self.ev, "pass_done", None)
                 return True
             except ServerDown as exc:
                 policy = self.cfg["comfyui"].get("on_server_down", "wait")
@@ -246,6 +257,28 @@ class Orchestrator:
                 if policy != "wait" or time.monotonic() > deadline or self.stop_requested():
                     return False
                 time.sleep(5)
+
+    def _estimate(self, by_mode: dict[str, list[dict]], ai_rows: list[dict], stages: tuple[str, ...],
+                  export: bool) -> None:
+        """Durée prévue du lancement (génération et, dans la chaîne complète, export) : annoncée dans la
+        console et transmise au bus de progression, qui la recale au fil des textures terminées."""
+        from . import eta
+        groups = {"ui": by_mode["ui"] if "ui" in stages else [],
+                  "local": by_mode["upscale"] if "local" in stages else [],
+                  "ai": ai_rows if "ai" in stages else []}
+        export_rows: list[dict] = []
+        if export:
+            chosen = [r for g in groups.values() for r in g]
+            ids = {r["id"] for r in chosen}
+            export_rows = [r for r in self.state.all("status IN ('done','fallback')") if r["id"] not in ids] + chosen
+        try:
+            per, est = eta.plan(self.cfg, self.provider_name, groups, export_rows)
+        except Exception as exc:                  # l'estimation ne doit jamais empêcher le traitement
+            self.ev.emit("info", message=tr("[ESTIMATION] indisponible : {exc}", exc=exc))
+            return
+        if hasattr(self.ev, "set_plan"):
+            self.ev.set_plan(per, est)
+        self.ev.emit("estimate", **est)
 
     def _on_progress(self, text: str) -> None:
         self.ev.emit("comfy_progress", message=text)

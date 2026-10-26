@@ -30,7 +30,7 @@ import os
 import re
 import sys
 import time
-from dataclasses import asdict, dataclass, fields
+from dataclasses import asdict, dataclass, fields, replace
 from pathlib import Path
 
 from . import __version__
@@ -50,6 +50,27 @@ FAMILIES = {
 # Échelle du denoise des préréglages (réglés pour SDXL + ControlNet Tile) : avec / sans ControlNet Tile.
 # Z-Image + Tile supporte un denoise plus fort ; sans ControlNet, il redessinerait les formes.
 DENOISE_SCALE = {"zimage": (1.3, 0.75)}
+
+# Rendu « photoréaliste créatif » : prompts photographiques au lieu des prompts « texture de jeu » par matériau
+# (la détection du matériau se trompe sur une image : un dessin pris pour du tissu se couvre de fils), contrôle
+# qualité réduit à un garde-fou (le détail inventé ne ressemble plus pixel à pixel à l'original).
+PHOTOREAL = {
+    "prompt_prefix": "photorealistic, ultra detailed, ",
+    "prompt_prefix_tiled": "photorealistic, ultra detailed, ",
+    "prompt_suffix": ", intricate micro detail, realistic materials and surface wear, sharp focus, high dynamic range",
+    "negative": ("blurry, lowres, soft focus, smeared, painting, illustration, cartoon, cel shading, flat shading, "
+                 "plastic, oversaturated, watermark, text, jpeg artifacts, deformed"),
+}
+# Denoise automatique : valeur du curseur (maximum du rendu) puis paliers relatifs, du plus fort au plus doux.
+# Fidèle : 0,60 est le plus fort denoise que le contrôle qualité accepte d'ordinaire sans voir la texture
+# transformée ; chaque palier n'est essayé que si le précédent a été jugé trop éloigné de l'original.
+AUTO_DENOISE = {"faithful": (0.60, [1.0, 0.82, 0.68]), "photoreal": (1.0, [1.0, 0.85, 0.7])}
+
+PHOTOREAL_QUALITY = {"min_structure": 0.3, "min_local": 0.05, "max_local_color": 0.35, "max_shift": 0.06,
+                     "color_match": 0.25}
+PHOTOREAL_QC = {"min_ssim": 0.15, "max_delta_e": 16.0, "max_delta_e_p95": 35.0, "max_hue_shift": 25.0,
+                "min_chroma_ratio": 0.45, "max_chroma_ratio": 2.2, "max_lightness_shift": 18.0,
+                "max_palette_distance": 0.8}
 STAGES = ("scan", "generate", "export")
 STAGE_LABELS = {"scan": N_("Scan et routage"), "generate": N_("Génération (UI, local, ComfyUI)"),
                 "export": N_("Contrôle qualité et export DDS")}          # tr(STAGE_LABELS[…]) à l'affichage
@@ -68,6 +89,10 @@ class RemasterSettings:
     provider: str = "comfyui"       # comfyui | esrgan (sans ComfyUI : Real-ESRGAN réaliste) | mock (simulation)
     server: str = "http://127.0.0.1:8188"
     model_family: str = "sdxl"      # sdxl | sd15 | zimage | custom
+    style: str = "faithful"         # faithful (textures, DA conservée) | photoreal (invente du détail, denoise ≤ 1)
+    subject: str = ""               # « Prompt à donner » : ajouté au prompt de chaque texture
+    prompt_only: bool = False       # envoyer ce texte seul, sans les ajouts automatiques (préfixe, matériau…)
+    auto_denoise: bool = False      # denoise au maximum du rendu, abaissé par paliers tant que la validation échoue
     workflow: str = ""              # famille custom : workflow au format API
     workflow_edges: str = ""
     checkpoint: str = ""            # vide : celui du workflow
@@ -119,6 +144,8 @@ class RemasterSettings:
             errs.append(tr("workflow personnalisé introuvable : {path}", path=self.workflow or tr("(vide)")))
         if self.model_family not in (*FAMILIES, "custom"):
             errs.append(tr("famille de modèle inconnue : {family}", family=self.model_family))
+        if self.style not in ("faithful", "photoreal"):
+            errs.append(tr("rendu inconnu : {style}", style=self.style))
         if self.provider not in ("comfyui", "esrgan", "mock"):
             errs.append(tr("moteur inconnu : {name}", name=self.provider))
         if self.target not in ("specialk", "loose", "remix", "png"):
@@ -196,11 +223,22 @@ def _toml(sections: dict, rules: list[dict]) -> str:
     return "\n".join(out)
 
 
+def effective(s: RemasterSettings) -> RemasterSettings:
+    """Réglages réellement appliqués : avec le denoise automatique, le curseur est au maximum du rendu."""
+    if s.auto_denoise and s.style in AUTO_DENOISE:
+        return replace(s, denoise=AUTO_DENOISE[s.style][0])
+    return s
+
+
 def material_presets(s: RemasterSettings) -> dict:
     """Denoise et force du ControlNet par matériau. En mode « par matériau », les curseurs
     décalent tous les préréglages de l'écart choisi par rapport au préréglage générique
     (la peau reste plus prudente que la pierre) ; sinon ils s'appliquent tels quels."""
+    s = effective(s)
     base = copy.deepcopy(DEFAULTS["materials"])
+    if s.style == "photoreal":                   # matériau peu fiable sur une image : même denoise partout
+        return {name: {**p, "denoise": round(s.denoise, 3), "cn_strength": round(s.cn_strength, 3)}
+                for name, p in base.items()}
     g = base.get("generic", {})
     d_off = s.denoise - float(g.get("denoise", 0.42))
     c_off = s.cn_strength - float(g.get("cn_strength", 0.75))
@@ -235,6 +273,7 @@ def write_project_config(s: RemasterSettings) -> Path:
     else:
         wf, wf_edges = FAMILIES[s.model_family]
     esrgan_exe = usable_esrgan(s.realesrgan_exe)
+    photo = s.style == "photoreal"
     bc7 = s.dds_format == "bc7"
     d3d11 = bc7 or s.target == "loose"          # Fallout 4 et Starfield : Direct3D 11, BC7 lisible
     sections = {
@@ -245,8 +284,12 @@ def write_project_config(s: RemasterSettings) -> Path:
         "provider": {"name": s.provider},
         "comfyui": {"server": s.server, "workflow": wf, "workflow_edges": wf_edges, "checkpoint": s.checkpoint,
                     "lora": s.lora, "lora_strength": float(s.lora_strength), "tiled": bool(s.tiled),
-                    "denoise_scale": DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[0],
-                    "denoise_scale_no_cn": DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[1],
+                    # photoréaliste : le curseur est le denoise réel de la passe globale (jusqu'à 1)
+                    "denoise_scale": 1.0 if photo else DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[0],
+                    "denoise_scale_no_cn": 1.0 if photo else DENOISE_SCALE.get(s.model_family, (1.0, 1.0))[1],
+                    "style": s.style, "subject": s.subject.strip(), "prompt_only": bool(s.prompt_only),
+                    **(PHOTOREAL if photo else {}),
+                    "denoise_ladder": AUTO_DENOISE[s.style][1] if s.auto_denoise and s.style in AUTO_DENOISE else [],
                     "tile_size": 512 if s.model_family == "sd15" else 1024},
         "routing": {"enabled": bool(s.route_ui), "force_ai": bool(s.force_ai)},
         "ui_upscale": {"realesrgan_exe": esrgan_exe},
@@ -257,6 +300,9 @@ def write_project_config(s: RemasterSettings) -> Path:
         "ba2": {"filter": s.ba2_filter},
         "materials": material_presets(s),
     }
+    if photo:
+        sections["quality"] = dict(PHOTOREAL_QUALITY)
+        sections["qc"].update(PHOTOREAL_QC)
     rules = []
     if not s.seamless:
         rules.append({"match": "*", "tile": False})
@@ -271,21 +317,59 @@ def write_project_config(s: RemasterSettings) -> Path:
 
 class ProgressBus(EventBus):
     """Bus d'événements qui calcule aussi l'avancement global du lot (événement « progress ») :
-    l'interface n'a qu'à l'afficher. Poids des étapes : scan 10 %, génération 60 %, export 30 %."""
+    l'interface n'a qu'à l'afficher. Poids des étapes : scan 10 %, génération 60 %, export 30 %.
+
+    Temps restant du lancement entier (eta_total_s) : durée prévue de chaque texture (eta.plan), recalée
+    en cours de route. ComfyUI : sur la durée réelle d'un passage (plusieurs textures avancent en même
+    temps dans la file, seul le passage mesure bien le travail fait) et sur le nombre de passages réellement
+    faits par texture terminée (nouveaux essais compris). Autres sous-étapes : sur le temps réel des textures
+    terminées rapporté à leur durée prévue."""
+
+    # poids (en passages) de la durée prévue d'un passage face aux mesures du lancement : plus fort quand elle a
+    # été mesurée sur ce PC, car elle compte aussi la fin de chaque texture (fondu, contrôle, PNG)
+    PRIOR = {False: 3.0, True: 12.0}
 
     WEIGHTS = {"scan": 0.10, "generate": 0.60, "export": 0.30}
+    COMPLETED = ("ui_done", "local_done", "comfy_done", "esrgan_done", "fallback")
 
     def __init__(self, *args, **kwargs) -> None:
         super().__init__(*args, **kwargs)
+        self.clock = time.monotonic
         self.stage = "scan"
         self.done = 0
         self.total = 0
-        self.t_stage = time.monotonic()
+        self.t_stage = self.clock()
         self._last = 0.0
         self.fatal: str | None = None        # workflow refusé par ComfyUI : la suite n'aurait pas de sens
+        self.plan: dict[str, tuple] = {}
+        self.est: dict | None = None
+        self.sub = ""
+        self.left = {g: 0.0 for g in ("ui", "local", "ai")}
+        self.grp = {g: {"t0": None, "t_last": None, "exp": 0.0, "passes": 0, "mp": 0.0}
+                    for g in ("ui", "local", "ai")}
+        self.passes_real = 0
+        self.t_pass = None                   # instant du dernier passage ComfyUI
+        self.real: dict[str, int] = {}      # passages faits par texture IA pas encore terminée
+        self.fin_real = 0                    # passages faits par les textures IA terminées
+        self.fin_planned = 0                 # passages prévus pour ces mêmes textures
+        self.t_export = None
+
+    def set_plan(self, per: dict, est: dict) -> None:
+        self.plan, self.est = dict(per), dict(est)
+        for g in self.left:
+            self.left[g] = sum(v[1] for v in per.values() if v[0] == g)
+
+    def pass_done(self, tid: str | None = None) -> None:
+        self.passes_real += 1
+        self.t_pass = self.clock()
+        if tid:
+            self.real[tid] = self.real.get(tid, 0) + 1
+        self._progress()
 
     def set_stage(self, stage: str) -> None:
-        self.stage, self.done, self.total, self.t_stage = stage, 0, 0, time.monotonic()
+        self.stage, self.done, self.total, self.t_stage = stage, 0, 0, self.clock()
+        if stage == "export":
+            self.sub, self.t_export = "", self.t_stage
         self._progress(force=True)
 
     def scan_progress(self, i: int, n: int) -> None:
@@ -296,21 +380,114 @@ class ProgressBus(EventBus):
         super().emit(event, **data)
         if event == "failed" and data.get("kind") == "workflow" and self.fatal is None:
             self.fatal = str(data.get("message", tr("workflow refusé")))
+        if event == "stage_start" and self.stage == "generate":
+            st = str(data.get("stage", ""))
+            self.sub = st if st in ("ui", "local") else "ai"
+            self.grp[self.sub]["t0"] = self.clock()
+            return
         if event == "run_start":
-            self.total, self.done, self.t_stage = int(data.get("total", 0)), 0, time.monotonic()
-        elif event in ("ui_done", "local_done", "comfy_done", "esrgan_done", "fallback") or \
-                (event == "failed" and self.stage == "generate"):
+            self.total, self.done, self.t_stage = int(data.get("total", 0)), 0, self.clock()
+        elif event in self.COMPLETED or (event == "failed" and self.stage == "generate"):
             self.done += 1
+            self._completed(str(data.get("texture") or ""))
         elif event == "qc_start":
-            self.total, self.done, self.t_stage = int(data.get("total", 0)), 0, time.monotonic()
+            self.total, self.done, self.t_stage = int(data.get("total", 0)), 0, self.clock()
         elif event == "qc_done":
             self.done = int(data.get("index", self.done + 1))
-        else:
+        elif event != "estimate":
             return
         self._progress(force=self.done >= self.total)
 
+    def _completed(self, tid: str) -> None:
+        item = self.plan.pop(tid, None)
+        if item is None:
+            return
+        g, secs, n, mp = item
+        self.left[g] = max(0.0, self.left[g] - secs)
+        if g == "ai":
+            self.fin_planned += n
+            self.fin_real += self.real.pop(tid, 0)
+        st = self.grp[g]
+        st["exp"] += secs
+        st["passes"] += n
+        st["mp"] += mp
+        st["t_last"] = self.clock()
+        if st["t0"] is None:
+            st["t0"] = st["t_last"]
+
+    def remaining_s(self) -> float | None:
+        """Temps restant estimé jusqu'à la fin du lancement (secondes), None tant qu'il n'est pas connu."""
+        if self.est is None or self.stage == "scan":
+            return None
+        now = self.clock()
+        export_s = float(self.est.get("export_s", 0))
+        if self.stage == "export":
+            done, total = min(self.done, self.total), self.total
+            spent = now - self.t_stage
+            if done >= 2 and total > done:
+                return spent / done * (total - done)
+            return max(export_s - spent, 0.1 * export_s) if total > done or not total else 0.0
+        rem = 0.0
+        for g in ("ui", "local", "ai"):
+            left = self.left[g]
+            if left <= 0:
+                continue
+            st = self.grp[g]
+            if g != self.sub or st["t0"] is None:
+                rem += left                        # sous-étape à venir : durée prévue
+            elif g == "ai" and self.est.get("passes") and self.passes_real:
+                # passages restants, puis la fin du dernier lot (fondu, contrôle et PNG des dernières textures,
+                # que plus aucun passage ne recouvre) : durée mesurée au lancement précédent
+                n = self._passes_left()
+                tail = float(self.est.get("tail_s") or 0.0)
+                rem += n * self._pass_rate(now) + (tail if n >= 1 else max(tail - (now - self.t_pass), 0.0))
+            elif st["exp"] > 0 and st["t_last"] is not None:
+                # recalage : temps réel / temps prévu des textures terminées de cette sous-étape
+                ratio = max(st["t_last"] - st["t0"], 0.0) / st["exp"]
+                rem += max(left * ratio - (now - st["t_last"]), 0.05 * left * ratio)
+            else:
+                rem += max(left - (now - st["t0"]), 0.1 * left)
+        return rem + export_s
+
+    def _inflation(self) -> float:
+        """Passages réellement faits par passage prévu, sur les textures terminées (nouveaux essais après un
+        refus, paliers de denoise essayés en plus)."""
+        if not self.fin_planned:
+            return 1.0
+        return min(3.0, max(0.5, self.fin_real / self.fin_planned))
+
+    def _passes_left(self) -> float:
+        todo = max(float(self.est.get("passes", 0)) - self.fin_planned, 0.0) * self._inflation()
+        inflight = sum(self.real.values())
+        return max(todo - inflight, 0.0)
+
+    def _pass_rate(self, now: float) -> float:
+        """Durée réelle d'un passage, frais compris, tirée vers la valeur prévue tant qu'il y a peu de mesures."""
+        prior = float(self.est.get("pass_s") or 10.0)
+        k = self.PRIOR[bool(self.est.get("pass_learned"))]
+        spent = max(now - self.grp["ai"]["t0"], 0.0)
+        return (spent + k * prior) / (self.passes_real + k)
+
+    def measured(self) -> dict:
+        """Durées réelles de la génération, pour eta.learn : {"ai": (s, passages, Mpx), "local": (s, Mpx)}."""
+        out = {}
+        for g in ("ai", "local"):
+            st = self.grp[g]
+            if st["t0"] is None or st["t_last"] is None or st["exp"] <= 0:
+                continue
+            secs = st["t_last"] - st["t0"]
+            if g == "ai" and self.passes_real and self.t_pass is not None:
+                # durée d'un passage prévu = durée d'un passage réel × passages réels par passage prévu, jusqu'au
+                # dernier passage ; la fin du dernier lot se mesure à part
+                out[g] = (self.t_pass - st["t0"], self.passes_real / self._inflation(), st["mp"])
+                if not any(v[0] == "ai" for v in self.plan.values()) and st["t_last"] >= self.t_pass:
+                    out["ai_tail"] = st["t_last"] - self.t_pass
+            else:
+                out[g] = (secs, st["passes"], st["mp"]) if g == "ai" else (secs, st["mp"])
+        return out
+
     def _progress(self, force: bool = False) -> None:
-        now = time.monotonic()
+        now = self.clock()
         if not force and now - self._last < 0.2:
             return
         self._last = now
@@ -321,15 +498,25 @@ class ProgressBus(EventBus):
         eta = None
         if done >= 2 and total > done:
             eta = round((now - self.t_stage) / done * (total - done))
+        rem = self.remaining_s()
         super().emit("progress", fraction=round(min(overall, 1.0), 4), stage=self.stage, done=done, total=total,
-                     eta_s=eta)
+                     eta_s=eta, eta_total_s=None if rem is None else round(rem))
 
     def finish(self) -> None:
-        super().emit("progress", fraction=1.0, stage="export", done=self.total, total=self.total, eta_s=0)
+        super().emit("progress", fraction=1.0, stage="export", done=self.total, total=self.total, eta_s=0,
+                     eta_total_s=0)
 
 
 class _Stopped(Exception):
     pass
+
+
+def _learn(cfg: dict, provider: str, measured: dict) -> None:
+    from .eta import learn
+    try:
+        learn(cfg, provider, measured)
+    except Exception:                    # mémoriser une durée ne doit jamais faire échouer le lancement
+        pass
 
 
 # ------------------------------------------------------------------ chaîne complète
@@ -449,10 +636,12 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     bus.emit("pipeline_stage", stage="generate", index=2, total=len(STAGES), label=tr(STAGE_LABELS["generate"]))
     orch = Orchestrator(cfg, bus, provider_name=s.provider)
     try:
-        gen = orch.run(limit=s.limit or None, redo_stale=s.redo_stale)
+        gen = orch.run(limit=s.limit or None, redo_stale=s.redo_stale, export_estimate=True)
     except FatalError as exc:
         bus.emit("failed", name="pipeline", stage="generate", kind="fatal", message=str(exc))
         return end(EXIT_FATAL, str(exc))
+    finally:
+        _learn(cfg, s.provider, bus.measured())   # textures terminées seulement : valable même après un arrêt
     if bus.fatal:
         # nœud ou modèle absent côté ComfyUI : exporter d'anciens résultats induirait en erreur
         return end(EXIT_FATAL, tr("workflow refusé par ComfyUI ({why}) — vérifie le checkpoint, la LoRA et les "
@@ -469,7 +658,8 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     try:
         pp = PostProcessor(cfg, bus, target=s.target, out_dir=out_dir, qc=s.qc, fix=s.qc_autofix,
                            encoder=s.encoder or None, state=state)
-        rep = pp.run(items_from_state(cfg, state))
+        items = items_from_state(cfg, state)
+        rep = pp.run(items)
     except EncoderError as exc:
         bus.emit("failed", name="pipeline", stage="export", kind="fatal", message=str(exc))
         return end(EXIT_FATAL, str(exc))
@@ -478,6 +668,8 @@ def run_remaster(s: RemasterSettings, bus: ProgressBus) -> int:
     qc_sum = rep["summary"]
     if qc_sum.get("stopped"):
         return end(EXIT_STOPPED)
+    _learn(cfg, s.provider, {"export": (float(qc_sum.get("seconds") or 0),
+                                        sum(it.an.width * it.k * it.an.height * it.k for it in items) / 1e6)})
     failed = gen.get("errors", 0) + qc_sum.get("error", 0)
     if gen.get("server_unreachable"):          # rien n'est passé par ComfyUI : ne pas afficher un succès
         return end(EXIT_ERRORS, tr("ComfyUI injoignable : matières agrandies sans IA générative"))

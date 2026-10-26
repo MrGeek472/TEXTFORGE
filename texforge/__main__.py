@@ -390,6 +390,57 @@ def cmd_selftest(args) -> int:
     return selftest_main()
 
 
+def cmd_update(args) -> int:
+    """Mise à jour depuis le dépôt GitHub : vérification, installation contrôlée, retour arrière."""
+    from . import updater
+    from .i18n import tr
+    if args.rollback:
+        try:
+            r = updater.rollback()
+        except updater.UpdateError as exc:
+            print(f"✗ {exc}", file=sys.stderr)
+            return 1
+        print(tr("Retour à TEXFORGE {to} : {n} fichier(s) restauré(s), {a} retiré(s).", to=r["to"], n=r["restored"],
+                 a=r["removed"]))
+        return 0
+    info = updater.check()
+    if info["error"]:
+        print(f"✗ {info['error']}", file=sys.stderr)
+        return 1
+    print(tr("Version installée : {local} — dépôt {repo} : {remote}", local=info["local"], repo=info["repo"],
+             remote=info["remote"]))
+    if not info["available"]:
+        print(tr("Version installée plus récente que le dépôt : rien à installer.") if info["newer_local"]
+              else tr("Aucune mise à jour."))
+        return 0
+    print(tr("Mise à jour disponible : {remote}", remote=info["remote"])
+          + (f" — {info['message']}" if info["message"] else ""))
+    if args.check:
+        return 0
+    if not args.yes:
+        try:
+            answer = input(tr("Installer la version {remote} ? [o/N] ", remote=info["remote"])).strip().lower()
+        except EOFError:
+            answer = ""
+        if answer not in ("o", "oui", "y", "yes"):
+            return 0
+    last = [-1]
+
+    def progress(done: int, total: int) -> None:
+        step = int(done * 10 / total) if total else done // (2 << 20)
+        if step != last[0]:
+            last[0] = step
+            print(tr("  téléchargé : {mb:.1f} Mo", mb=done / 2 ** 20), flush=True)
+    try:
+        r = updater.apply(info, progress, log=print)
+    except updater.UpdateError as exc:
+        print(f"✗ {exc}", file=sys.stderr)
+        return 1
+    print(tr("TEXFORGE {to} installé : relance l'application (retour arrière : texforge update --rollback).",
+             to=r["to"]))
+    return 0
+
+
 def cmd_install_realesrgan(args) -> int:
     """Télécharge realesrgan-ncnn-vulkan (version officielle, empreinte vérifiée) dans tools/."""
     from .esrgan import INSTALL_DIR, RELEASES, EsrganError, find_realesrgan, install_realesrgan, platform_key
@@ -590,6 +641,11 @@ def main(argv=None) -> int:
     s = sub.add_parser("install-realesrgan", help="télécharger Real-ESRGAN (mode sans ComfyUI, 45 Mo)")
     s.add_argument("--force", action="store_true", help="réinstaller même s'il est déjà présent")
     s.set_defaults(fn=cmd_install_realesrgan)
+    s = sub.add_parser("update", help="mettre à jour TEXFORGE depuis son dépôt GitHub")
+    s.add_argument("--check", action="store_true", help="vérifier seulement")
+    s.add_argument("--yes", action="store_true", help="installer sans demander confirmation")
+    s.add_argument("--rollback", action="store_true", help="revenir à la version d'avant la dernière mise à jour")
+    s.set_defaults(fn=cmd_update)
     s = sub.add_parser("detect", help="trouver les dossiers de textures extraites (Special K, RTX Remix)")
     s.add_argument("path", nargs="*", help="dossiers de jeux à inclure dans la recherche")
     s.add_argument("--json", action="store_true", help="résultat en JSON")

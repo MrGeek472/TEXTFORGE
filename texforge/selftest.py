@@ -447,6 +447,83 @@ def _selftest_tiles(cfg: dict, failures: list) -> None:
            "famille Z-Image Turbo : ControlNet Tile branché, retiré proprement si son fichier manque, denoise "
            "plus fort avec lui, plus doux sans lui", failures)
 
+    # rendu photoréaliste créatif : prompts photo (sans matériau), contrôle qualité réduit, passe globale puis morceaux
+    from .remaster import RemasterSettings, write_project_config
+    tmpw = Path(tempfile.mkdtemp(prefix="texforge_photo_"))
+    try:
+        cfgp = load_config(write_project_config(RemasterSettings(
+            input_dir=str(tmpw), output_dir=str(tmpw / "out"), work_dir=str(tmpw / "proj"), model_family="zimage",
+            style="photoreal", subject="green armored soldier, gold visor", denoise=0.85)))
+    finally:
+        shutil.rmtree(tmpw, ignore_errors=True)
+    prov = SimpleNamespace(cfg=cfgp, c=cfgp["comfyui"], wf_edges=None, denoise_scale=cfgp["comfyui"]["denoise_scale"])
+    ctx = ComfyUIProvider.build_context(prov, {"name": "img", "analysis": {"material": "fabric"}},
+                                        Analysis(64, 64, "none", False, False, 0.1, 0.1, False, "ai", "", ""))
+    _check(ctx["style"] == "photoreal" and "weave" not in ctx["prompt"] and "gold visor" in ctx["prompt"]
+           and "photorealistic" in ctx["prompt"] and abs(ctx["denoise"] - 0.85) < 1e-6 and 0.25 <= ctx["refine_denoise"] <= 0.45
+           and cfgp["qc"]["min_ssim"] < 0.3 and cfgp["quality"]["min_structure"] < 0.5,
+           f"photoréaliste : prompt sans matériau avec la description, denoise {ctx['denoise']} tel quel, "
+           f"affinage {ctx['refine_denoise']}, contrôle qualité assoupli", failures)
+    seen = []
+
+    def fake_one2(piece, c2, prompt, negative, seed, tiled=False):
+        seen.append((piece.size, c2["denoise"], c2["tiling"]))
+        return piece.convert("RGB")
+    stub2 = SimpleNamespace(backend=SimpleNamespace(on_progress=None), _generate_one=fake_one2, cfg=cfgp,
+                            _generate_tiled=lambda *a, **k: ComfyUIProvider._generate_tiled(stub2, *a, **k),
+                            _global_pass=lambda *a, **k: ComfyUIProvider._global_pass(stub2, *a, **k))
+    big = Image.new("RGB", (2304, 2304), (90, 120, 80))
+    res, _u = ComfyUIProvider.generate(stub2, big, [], "", "", "1:1", 3, lambda _r: None,
+                                       context={**ctx, "tiles": {"size": 1024, "overlap": 128}})
+    _check(res.size == big.size and seen[0][0][0] <= 1024 and seen[0][1] == ctx["denoise"]
+           and all(d == ctx["refine_denoise"] and tl == "disable" for _s, d, tl in seen[1:]) and len(seen) == 1 + 9,
+           f"photoréaliste : 1 passe globale à {ctx['denoise']} sur l'image entière ({seen[0][0]}), puis "
+           f"{len(seen) - 1} morceaux à {ctx['refine_denoise']}", failures)
+
+    # « Prompt à donner » : ajouté au prompt automatique, ou envoyé seul
+    from .config import DEFAULTS as _D
+    from .providers import compose_prompt
+    base_c = {**_D["comfyui"], "subject": "scratched green armor,\n gold visor"}
+    pa = compose_prompt(base_c, "mossy", "worn painted metal", False)
+    pb = compose_prompt({**base_c, "prompt_only": True}, "mossy", "worn painted metal", True)
+    pc = compose_prompt({**base_c, "style": "photoreal"}, "", "woven fabric", False)
+    _check(pa.startswith(_D["comfyui"]["prompt_prefix"]) and "scratched green armor, gold visor" in pa
+           and "worn painted metal" in pa and pb == "mossy, scratched green armor, gold visor" and "woven" not in pc,
+           f"prompt à donner : ajouté (« {pa[:60]}… »), seul (« {pb} »), sans matériau en photoréaliste", failures)
+
+    # denoise automatique : maximum du rendu, un palier plus bas seulement si la validation refuse
+    from .remaster import AUTO_DENOISE, material_presets as presets_of
+    pf = presets_of(RemasterSettings(model_family="sdxl", auto_denoise=True, denoise=0.3))
+    pp = presets_of(RemasterSettings(model_family="sdxl", style="photoreal", auto_denoise=True, denoise=0.3))
+    _check(abs(pf["generic"]["denoise"] - AUTO_DENOISE["faithful"][0]) < 1e-6 and abs(pp["generic"]["denoise"] - 1.0) < 1e-6,
+           f"denoise automatique : curseur ignoré, maximum du rendu (fidèle {pf['generic']['denoise']}, "
+           f"photoréaliste {pp['generic']['denoise']})", failures)
+    calls3 = []
+
+    def fake_one3(piece, c3, prompt, negative, seed, tiled=False):
+        calls3.append((c3["stem"][-3:], c3["denoise"], piece.size))
+        return piece.convert("RGB")
+    verdicts = iter([False, True])                 # 1er palier refusé (texture transformée), 2e accepté
+    stub3 = SimpleNamespace(backend=SimpleNamespace(on_progress=None), _generate_one=fake_one3, cfg=cfgp,
+                            _faithful_enough=lambda ref, out: next(verdicts),
+                            _probe_denoise=lambda *a, **k: ComfyUIProvider._probe_denoise(stub3, *a, **k),
+                            _generate_tiled=lambda *a, **k: ComfyUIProvider._generate_tiled(stub3, *a, **k))
+    fctx = {"style": "faithful", "denoise": 0.6, "denoise_ladder": AUTO_DENOISE["faithful"][1], "stem": "t",
+            "tiling": "disable", "tiles": {"size": 1024, "overlap": 128}, "attempt": 0}
+    ComfyUIProvider.generate(stub3, Image.new("RGB", (2304, 2304), (90, 90, 90)), [], "", "", "1:1", 1,
+                             lambda _r: None, context=fctx)
+    probes = [c for c in calls3 if "_p" in c[0]]
+    tiles_d = {c[1] for c in calls3 if "_p" not in c[0]}
+    _check([round(c[1], 3) for c in probes] == [0.6, 0.492] and tiles_d == {0.492}
+           and all(max(c[2]) <= 1024 for c in probes),
+           f"fidèle automatique : essais à 1 Mpx {[round(c[1], 3) for c in probes]}, morceaux au premier accepté "
+           f"{sorted(tiles_d)}", failures)
+    calls3.clear()
+    ComfyUIProvider.generate(stub3, Image.new("RGB", (512, 512)), [], "", "", "1:1", 1, lambda _r: None,
+                             context={**fctx, "tiles": None, "attempt": 2})
+    _check([round(c[1], 3) for c in calls3] == [0.408],
+           f"sans morceaux : le 3e essai de la texture passe au 3e palier ({[c[1] for c in calls3]})", failures)
+
     tmpf = Path(tempfile.mkdtemp(prefix="texforge_cmp_"))
     try:
         for n in ("ai", "res"):
@@ -604,9 +681,316 @@ def _selftest_normals(cfg: dict, failures: list) -> None:
                f"{nm} : contrôle qualité sans faux échec ({res.decision} {'; '.join(res.reasons)[:80]})", failures)
 
 
+def _selftest_eta(tmp: Path, cfg: dict, failures: list) -> None:
+    """Estimation du temps : passages ComfyUI comptés comme le moteur les fera, recalage en cours de lot,
+    durées apprises d'un lancement à l'autre."""
+    import copy
+
+    from . import eta
+    from .remaster import ProgressBus
+
+    c = copy.deepcopy(cfg)
+    c["output"].update(scale=4, max_side=4096)
+    c["comfyui"].update(tiled=True, tile_size=1024, tile_overlap=128, style="faithful", denoise_ladder=[])
+
+    def row(w, h, tile=False, tid="t"):
+        return {"id": tid, "width": w, "height": h, "analysis": {"tile_x": tile, "tile_y": tile}}
+
+    counts = [eta.passes_for(row(1024, 1024), c), eta.passes_for(row(1024, 1024, True), c),
+              eta.passes_for(row(2048, 1024), c), eta.passes_for(row(256, 256), c)]
+    photo = copy.deepcopy(c)
+    photo["comfyui"]["style"] = "photoreal"
+    auto = copy.deepcopy(c)
+    auto["comfyui"]["denoise_ladder"] = [1.0, 0.82, 0.68]
+    flat = copy.deepcopy(c)
+    flat["comfyui"]["tiled"] = False
+    extra = [eta.passes_for(row(1024, 1024), photo), eta.passes_for(row(1024, 1024), auto),
+             eta.passes_for(row(1024, 1024), flat)]
+    _check(counts == [25, 25, 15, 1] and extra == [26, 26, 1],
+           f"passages comptés comme le moteur : 4096² = 25 morceaux, 4096×2048 = 15, petite texture 1 ; "
+           f"+1 passe globale ou essai du denoise ; sans morceaux 1 ({counts}, {extra})", failures)
+
+    old = __import__("os").environ.get("TEXFORGE_TIMINGS")
+    __import__("os").environ["TEXFORGE_TIMINGS"] = str(tmp / "timings_eta.json")
+    try:
+        per, est = eta.plan(c, "comfyui", {"ai": [row(1024, 1024, tid="a"), row(256, 256, tid="b")],
+                                           "local": [row(512, 512, tid="l")]}, [row(1024, 1024, tid="a")])
+        default = eta.DEFAULT_PASS_S[eta.family_of(c)]
+        _check(est["passes"] == 26 and abs(est["ai_s"] - 26 * default) <= 1 and est["export"] == 1
+               and est["total_s"] == est["generate_s"] + est["export_s"] and not est["pass_learned"],
+               f"estimation : {est['passes']} passages × {default} s par défaut, export de 16,8 Mpx "
+               f"({eta.describe(est)})", failures)
+
+        bus = ProgressBus(tmp / "eta_work", console=False)
+        t = [0.0]
+        bus.clock = lambda: t[0]
+        bus.set_stage("generate")
+        bus.set_plan({"a": ("ai", 100.0, 10, 16.8), "b": ("ai", 100.0, 10, 16.8), "l": ("local", 2.0, 0, 4.0)},
+                     {"export_s": 20, "passes": 20, "pass_s": 10.0})
+        r0 = bus.remaining_s()                    # rien de commencé : 2 + 200 + 20 prévus
+        bus.emit("stage_start", stage="local", count=1)
+        t[0] = 1.0
+        bus.emit("local_done", texture="l", name="l")
+        bus.emit("stage_start", stage="comfyui", count=2)
+        for tid, at in (("a", 16.0), ("b", 31.0)):
+            t[0] = at
+            bus.pass_done(tid)
+        r1 = bus.remaining_s()                    # (30 s + 4 × 10 s prévus) / 6 = 11,7 s par passage, 18 à faire
+        for i in range(19):                       # les deux textures avancent ensemble dans la file
+            t[0] += 5.0
+            bus.pass_done("a" if i < 11 else "b")
+        bus.emit("comfy_done", texture="a", name="a")
+        r2 = bus.remaining_s()                    # a : 12 passages pour 10 prévus (×1,2) ; b en a fait 9 sur 12
+        t[0] += 10.0
+        r3 = bus.remaining_s()
+        for _ in range(3):
+            t[0] += 5.0
+            bus.pass_done("b")
+        t[0] += 9.0                               # fin du lot : fondu, contrôle et PNG après le dernier passage
+        bus.emit("comfy_done", texture="b", name="b")
+        m = bus.measured()
+        bus.close()
+        got = [round(x) for x in (r0, r1, r2, r3)]
+        _check(got == [222, 236, 39, 41],
+               f"temps restant recalé sur les passages réels (textures en parallèle dans la file, essais en plus "
+               f"compris) : {got}", failures)
+        eta.learn(c, "comfyui", m)
+        first = eta.rates(c)
+        eta.learn(c, "comfyui", {"ai": (300.0, 10, 16.8)})
+        second = eta.rates(c)
+        eta.learn(c, "mock", {"ai": (999.0, 1, 1.0)})
+        want1 = round(150 / (24 / 1.2), 2)
+        want2 = round(0.5 * want1 + 0.5 * 30.0, 2)
+        _per2, est2 = eta.plan(c, "comfyui", {"ai": [row(1024, 1024, tid="a")]}, [])
+        _check(first["pass_learned"] and first["pass_s"] == want1 and first["tail_s"] == 9.0
+               and second["pass_s"] == want2 and eta.rates(c)["pass_s"] == want2
+               and abs(est2["ai_s"] - (25 * want2 + 9.0)) <= 1,
+               f"durées apprises : passage prévu {first['pass_s']} s (essais en plus compris), fin du dernier lot "
+               f"{first['tail_s']} s, moyenne glissante {second['pass_s']} s, simulation ignorée", failures)
+        _check([eta.fmt(x) for x in (42, 125, 3725, 3 * 86400 + 7200)] == [tr("{s} s", s=42), tr("{m} min", m=2),
+                                                                           tr("{h} h {m:02d}", h=1, m=2),
+                                                                           tr("{d} j {h} h", d=3, h=2)],
+               "durées lisibles et arrondies", failures)
+    finally:
+        if old is None:
+            __import__("os").environ.pop("TEXFORGE_TIMINGS", None)
+        else:
+            __import__("os").environ["TEXFORGE_TIMINGS"] = old
+
+    ev = tmp / "projet_ba2" / "work" / "events.jsonl"
+    if ev.exists():
+        lines = [json.loads(x) for x in ev.read_text(encoding="utf-8").splitlines() if x.strip()]
+        ests = [x for x in lines if x.get("event") == "estimate"]
+        after = lines[lines.index(ests[0]) + 1:] if ests else []
+        rest = [x.get("eta_total_s") for x in after if x.get("event") == "progress"]
+        _check(len(ests) == 1 and ests[0].get("export", 0) >= 2 and rest and all(r is not None for r in rest)
+               and rest[-1] == 0,
+               f"chaîne complète : estimation annoncée une fois (génération + export), temps restant dans chaque "
+               f"avancement qui suit ({len(ests)}, {len(rest)} avancements, dernier {rest[-1:]})", failures)
+
+
+def _selftest_stale(tmp: Path, inp: Path, failures: list) -> None:
+    """Réglages changés entre deux lancements : chaque texture IA repart avec tous ses essais."""
+    from .remaster import ProgressBus, RemasterSettings, run_remaster
+    from .state import State
+
+    work = tmp / "projet_reglages"
+    seen = []
+    for d in (0.42, 0.50, 0.58, 0.66):
+        s = RemasterSettings(input_dir=str(inp), output_dir=str(tmp / "sortie_reglages"), work_dir=str(work),
+                             provider="mock", target="png", denoise=d)
+        bus = ProgressBus(work / "work", console=False)
+        try:
+            code = run_remaster(s, bus)
+        finally:
+            bus.close()
+        st = State(work / "work" / "texforge_state.db")
+        seen.append((code, sorted({(r["status"], r["attempts"]) for r in st.all() if r["mode"] == "ai"})))
+        st.close()
+    _check(all(c == 0 and rows == [("done", 1)] for c, rows in seen),
+           f"denoise changé 3 fois : chaque texture IA regénérée dès le 1er essai, aucune passée en agrandissement "
+           f"simple faute d'essais ({seen[-1]})", failures)
+
+
+class FakeGitHub:
+    """Faux GitHub local (API commits/HEAD, fichiers bruts, archive zip d'un commit) servant un dossier ;
+    sert aussi aux tests de l'interface. Usage : with FakeGitHub(dossier, "1.2.3") as gh: gh.env()…"""
+
+    def __init__(self, folder: Path, message: str = "Nouvelle version", repo: str = "test/TEXTFORGE") -> None:
+        import hashlib
+        import http.server
+        import io
+        import threading
+        import zipfile
+        self.repo, self.folder, self.message = repo, Path(folder), message
+        self.sha = hashlib.sha1(str(folder).encode()).hexdigest()
+        self.extra: dict[str, bytes] = {}          # entrées ajoutées telles quelles (chemins piégés)
+        outer = self
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *_a):
+                pass
+
+            def do_GET(self):
+                path = self.path.split("?")[0]
+                if path == f"/api/repos/{outer.repo}/commits/HEAD":
+                    body = json.dumps({"sha": outer.sha, "commit": {"message": outer.message + "\n\ndétail",
+                                       "committer": {"date": "2026-10-26T12:00:00Z"}}}).encode()
+                elif path.startswith(f"/raw/{outer.repo}/"):
+                    rel = path.split("/", 5)[-1]
+                    f = outer.folder / rel
+                    if not f.is_file():
+                        self.send_error(404)
+                        return
+                    body = f.read_bytes()
+                elif path.startswith(f"/codeload/{outer.repo}/zip/"):
+                    buf = io.BytesIO()
+                    top = f"TEXTFORGE-{outer.sha}/"
+                    with zipfile.ZipFile(buf, "w") as z:
+                        for f in sorted(outer.folder.rglob("*")):
+                            if f.is_file():
+                                z.write(f, top + f.relative_to(outer.folder).as_posix())
+                        for name, data in outer.extra.items():
+                            z.writestr(top + name, data)
+                    body = buf.getvalue()
+                else:
+                    self.send_error(404)
+                    return
+                self.send_response(200)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        self.thread = threading.Thread(target=self.server.serve_forever, daemon=True)
+
+    def env(self) -> dict:
+        base = f"http://127.0.0.1:{self.server.server_address[1]}"
+        return {"TEXFORGE_UPDATE_REPO": self.repo, "TEXFORGE_UPDATE_API": f"{base}/api",
+                "TEXFORGE_UPDATE_RAW": f"{base}/raw", "TEXFORGE_UPDATE_CODELOAD": f"{base}/codeload"}
+
+    def __enter__(self):
+        self.thread.start()
+        return self
+
+    def __exit__(self, *_exc):
+        self.server.shutdown()
+        self.server.server_close()
+
+
+def _project_copy(dest: Path, version: str) -> Path:
+    """Copie de l'installation (code seulement) avec une autre version."""
+    src = Path(__file__).resolve().parent.parent
+    dest.mkdir(parents=True)
+    for name in ("app_gui.py", "gui_compare.py", "requirements.txt"):
+        if (src / name).is_file():
+            shutil.copy2(src / name, dest / name)
+    shutil.copytree(src / "texforge", dest / "texforge", ignore=shutil.ignore_patterns("__pycache__"))
+    init = dest / "texforge" / "__init__.py"
+    import re as _re
+    init.write_text(_re.sub(r'__version__ = "[^"]+"', f'__version__ = "{version}"', init.read_text(encoding="utf-8")),
+                    encoding="utf-8")
+    return dest
+
+
+def _digest(folder: Path) -> dict:
+    import hashlib
+    return {f.relative_to(folder).as_posix(): hashlib.sha1(f.read_bytes()).hexdigest()
+            for f in sorted(folder.rglob("*")) if f.is_file() and "__pycache__" not in f.parts}
+
+
+def _selftest_update(tmp: Path, failures: list) -> None:
+    """Mise à jour depuis GitHub (faux serveur local) : détection, refus d'un dépôt incomplet ou cassé,
+    installation contrôlée, sauvegarde, retour arrière."""
+    import os
+
+    from . import __version__, updater
+
+    base = tmp / "maj"
+    root = _project_copy(base / "installation", __version__)
+    good = _project_copy(base / "depot", "99.0.0")
+    (good / "texforge" / "nouveau_module.py").write_text("VALEUR = 1\n", encoding="utf-8")
+    eta = good / "texforge" / "eta.py"
+    eta.write_text(eta.read_text(encoding="utf-8") + "\n# modifié dans le dépôt\n", encoding="utf-8")
+    before = _digest(root)
+    saved = {k: os.environ.get(k) for k in ("TEXFORGE_UPDATE_REPO", "TEXFORGE_UPDATE_API", "TEXFORGE_UPDATE_RAW",
+                                             "TEXFORGE_UPDATE_CODELOAD", "TEXFORGE_UPDATE_DIR", "TEXFORGE_UPDATE_ROOT")}
+    os.environ["TEXFORGE_UPDATE_DIR"] = str(base / "donnees")
+    os.environ["TEXFORGE_UPDATE_ROOT"] = str(root)
+    try:
+        with FakeGitHub(good, "Ajoute l'estimation du temps") as gh:
+            os.environ.update(gh.env())
+            info = updater.check()
+            _check(info["available"] and info["remote"] == "99.0.0" and info["sha"] == gh.sha
+                   and info["message"] == "Ajoute l'estimation du temps" and not info["error"],
+                   f"dépôt plus récent détecté ({info['local']} -> {info['remote']}, « {info['message']} »)", failures)
+
+            def refused(prepare, undo, expect: str, label: str) -> None:
+                prepare()
+                try:
+                    updater.apply(updater.check())
+                    ok, why = False, "installée"
+                except updater.UpdateError as exc:
+                    ok, why = expect in str(exc), str(exc)
+                finally:
+                    undo()
+                _check(ok and _digest(root) == before, f"{label} : refusé, rien de modifié ({why[:110]})", failures)
+
+            gc = good / "gui_compare.py"
+            data = gc.read_bytes()
+            refused(gc.unlink, lambda: gc.write_bytes(data), "gui_compare", "dépôt incomplet (gui_compare.py absent)")
+            bad = good / "texforge" / "casse.py"
+            refused(lambda: bad.write_text("def f(:\n", encoding="utf-8"), bad.unlink, "casse.py",
+                    "erreur de syntaxe dans le dépôt")
+            refused(lambda: gh.extra.update({"../evil.py": b"x = 1\n"}), gh.extra.clear, "evil.py",
+                    "chemin sortant du dossier dans l'archive")
+
+            pip_calls = []
+            real_pip = updater._pip_install
+            updater._pip_install = lambda req, py, say: pip_calls.append(req.name)
+            req = good / "requirements.txt"
+            req.write_text(req.read_text(encoding="utf-8") + "rich>=13\n", encoding="utf-8")
+            try:
+                logs: list[str] = []
+                res = updater.apply(updater.check(), log=logs.append)
+            finally:
+                updater._pip_install = real_pip
+            after = _digest(root)
+            _check(res["to"] == "99.0.0" and res["added"] == 1 and res["replaced"] == 3
+                   and updater.installed_version(root) == "99.0.0" and after == _digest(good)
+                   and pip_calls == ["requirements.txt"],
+                   f"installée : {res['replaced']} fichiers remplacés (version, eta.py, requirements), "
+                   f"{res['added']} ajouté, dépendances installées par pip, copie identique au dépôt", failures)
+            again = updater.check()
+            _check(again["restart"] and not again["available"] and again["backup"] == __version__,
+                   "après installation : redémarrage demandé, plus rien à installer, retour arrière proposé", failures)
+            back = updater.rollback()
+            _check(back["to"] == __version__ and _digest(root) == before and updater.last_backup() is None,
+                   f"retour arrière : installation d'origine à l'identique ({back['restored']} restaurés, "
+                   f"{back['removed']} retiré)", failures)
+        old = _project_copy(base / "depot_ancien", "0.0.1")
+        with FakeGitHub(old) as gh:
+            os.environ.update(gh.env())
+            info = updater.check()
+            _check(not info["available"] and info["newer_local"],
+                   "dépôt plus ancien que l'installation (0.0.1) : rien proposé, pastille grise", failures)
+        os.environ["TEXFORGE_UPDATE_API"] = os.environ["TEXFORGE_UPDATE_RAW"] = "http://127.0.0.1:9/x"
+        info = updater.check(timeout=2)
+        _check(bool(info["error"]) and not info["available"], f"GitHub injoignable : {info['error'][:80]}", failures)
+    finally:
+        for k, v in saved.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
 def main() -> int:
     failures: list[str] = []
     tmp = Path(tempfile.mkdtemp(prefix="texforge_selftest_"))
+    import os
+    saved_timings = os.environ.get("TEXFORGE_TIMINGS")
+    os.environ["TEXFORGE_TIMINGS"] = str(tmp / "timings.json")    # durées des lancements de test : à part
     try:
         inp = tmp / "entree"
         expected = make_textures(inp)
@@ -819,11 +1203,24 @@ def main() -> int:
 
         print("15. Tout par l'IA, génération par morceaux, panneau avant / après")
         _selftest_tiles(cfg, failures)
+
+        print("16. Estimation du temps du lancement")
+        _selftest_eta(tmp, cfg, failures)
+
+        print("17. Réglages changés entre deux lancements")
+        _selftest_stale(tmp, inp, failures)
+
+        print("18. Mise à jour depuis GitHub (faux serveur local)")
+        _selftest_update(tmp, failures)
     except Exception:
         traceback.print_exc()
         failures.append("exception")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
+        if saved_timings is None:
+            os.environ.pop("TEXFORGE_TIMINGS", None)
+        else:
+            os.environ["TEXFORGE_TIMINGS"] = saved_timings
     print()
     if failures:
         print(f"SELFTEST : {len(failures)} échec(s)")

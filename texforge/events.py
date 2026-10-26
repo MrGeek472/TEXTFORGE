@@ -22,7 +22,7 @@ EVENT_TYPES = (
     "run_start", "stage_start", "stage_end", "routed", "ui_done", "local_done", "comfy_queued", "comfy_progress",
     "comfy_done", "fallback", "retry", "failed", "gpu_free", "gpu_status", "server_down", "server_back",
     "stopped", "run_end", "info", "qc_start", "qc_done", "qc_end",
-    "pipeline_start", "pipeline_stage", "progress", "pipeline_end", "esrgan_done",
+    "pipeline_start", "pipeline_stage", "progress", "pipeline_end", "esrgan_done", "estimate",
 )
 _QC_TAG = {"validated": "[QC] ✔", "corrected": "[QC] ✎", "rejected": "[QC] ✘", "local": "[QC] ·",
            "measured": "[QC] =", "error": "[QC] !"}
@@ -89,6 +89,9 @@ def _fmt(rec: dict[str, Any]) -> str | None:
         return rec.get("message", "")
     if e == "progress":
         return None
+    if e == "estimate":
+        from .eta import describe
+        return describe(rec)
     if e == "pipeline_start":
         lora = tr(", LoRA {lora}", lora=rec["lora"]) if rec.get("lora") else ""
         return (tr("[INFO] Chaîne complète — entrée {input}", input=rec.get("input", "")) + "\n"

@@ -87,6 +87,7 @@ DEFAULTS: dict = {
         "checkpoint": "", "controlnet_model": "", "lora": "", "lora_strength": 0.8,
         "max_in_flight": 2, "timeout": 600,
         "tiled": False, "tile_size": 1024, "tile_overlap": 128,
+        "style": "faithful", "subject": "", "prompt_only": False, "denoise_scale": 1.0, "denoise_scale_no_cn": 1.0, "denoise_ladder": [],
         "batch_size": 12, "free_vram": "auto", "vram_threshold_gb": 1.5,
         "free_between_groups": True, "free_every": 100,
         "max_transient_retries": 2, "max_consecutive_failures": 8,
@@ -178,7 +179,9 @@ def result_fingerprint(cfg: dict) -> str:
         "comfyui": {k: cfg["comfyui"].get(k) for k in ("workflow", "workflow_edges", "prompt_prefix",
                                                      "prompt_prefix_tiled", "prompt_suffix", "negative",
                                                      "checkpoint", "controlnet_model", "lora", "lora_strength",
-                                                     "tiled", "tile_size", "tile_overlap")},
+                                                     "tiled", "tile_size", "tile_overlap", "style", "subject",
+                                                     "prompt_only",
+                                                     "denoise_scale", "denoise_scale_no_cn", "denoise_ladder")},
         "materials": cfg.get("materials", {}),
         "esrgan": cfg.get("esrgan", {}) if cfg["provider"]["name"] == "esrgan" else {},
     }

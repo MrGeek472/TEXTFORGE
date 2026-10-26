@@ -265,6 +265,7 @@ class ComfyUIProvider:
         self._missing: set[str] = set()       # types de nœuds absents du serveur (contournés)
         self._edges_off = False               # workflow Tile+Canny inutilisable sur ce serveur
         self.on_note: Callable[[str], None] | None = None
+        self.on_pass: Callable[[str | None], None] | None = None   # passage terminé (id de la texture)
         try:
             self.wf_main = customize_workflow(chc.ComfyWorkflow.from_file(
                 resolve_workflow_path(cfg, self.c["workflow"])), self.c, chc)
@@ -538,14 +539,18 @@ class ComfyUIProvider:
         preset = {**self.cfg["materials"].get("generic", {}), **self.cfg["materials"].get(material, {})}
         tiling = ("enable" if an.tile_x and an.tile_y else "x_only" if an.tile_x
                   else "y_only" if an.tile_y else "disable")
-        hint = (rec.get("hint") or "").strip()
-        body = ", ".join(x for x in (hint, str(preset.get("prompt", ""))) if x)
-        prefix = self.c["prompt_prefix_tiled"] if tiling != "disable" else self.c["prompt_prefix"]
-        edges = bool(preset.get("edges")) and self.wf_edges is not None
-        denoise = min(0.9, max(0.08, float(preset.get("denoise", 0.42)) * getattr(self, "denoise_scale", 1.0)))
-        return {"material": material, "tiling": tiling, "edges": edges,
-                "prompt": f"{prefix}{body}{self.c['prompt_suffix']}", "negative": str(self.c["negative"]),
+        style = str(self.c.get("style") or "faithful")
+        prompt = compose_prompt(self.c, (rec.get("hint") or "").strip(), str(preset.get("prompt", "")),
+                                tiling != "disable")
+        edges = bool(preset.get("edges")) and self.wf_edges is not None and style != "photoreal"
+        top = 1.0 if style == "photoreal" else 0.9
+        denoise = min(top, max(0.08, float(preset.get("denoise", 0.42)) * getattr(self, "denoise_scale", 1.0)))
+        return {"material": material, "tiling": tiling, "edges": edges, "style": style,
+                "prompt": prompt, "negative": str(self.c["negative"]),
                 "denoise": round(denoise, 3), "cn_strength": float(preset.get("cn_strength", 0.75)),
+                # affinage par morceaux après la passe globale : assez pour le grain, pas pour réinventer
+                "refine_denoise": round(min(0.45, max(0.25, denoise * 0.5)), 3),
+                "denoise_ladder": [float(f) for f in (self.c.get("denoise_ladder") or [])],
                 "stem": rec.get("name") or "texture"}
 
     # ------------------------------------------------------------ génération
@@ -554,11 +559,69 @@ class ComfyUIProvider:
                  context: dict | None = None) -> tuple[Image.Image, str]:
         ctx = context or {}
         on_submitted(f"local-{uuid.uuid4().hex[:12]}")
+        top = float(ctx.get("denoise") or 0.42)
+        ladder = [float(f) for f in ctx.get("denoise_ladder") or []]
+        # denoise automatique : un palier plus bas à chaque nouvel essai de la texture
+        steps = [min(1.0, top * f) for f in ladder[min(int(ctx.get("attempt", 0)), len(ladder) - 1):]] if ladder else [top]
+        ctx = {**ctx, "denoise": round(steps[0], 3)}
         tiles = ctx.get("tiles")
         if tiles and max(image.size) > int(tiles["size"]):
+            if ctx.get("style") == "photoreal":
+                # passe globale : le modèle voit toute l'image (sujet, matières, lumière) et réinvente au denoise
+                # demandé ; les morceaux ne font ensuite qu'affiner, sinon chacun invente son propre motif
+                image, d = self._global_pass(image, ctx, prompt, negative, seed, steps)
+                ctx = {**ctx, "denoise": round(min(0.45, max(0.25, d * 0.5)), 3)}
+            elif len(steps) > 1:
+                # fidèle : le palier se choisit sur un essai à 1 mégapixel (quelques secondes) plutôt que sur
+                # une génération complète par morceaux (plusieurs minutes)
+                ctx = {**ctx, "denoise": self._probe_denoise(image, ctx, prompt, negative, seed, steps)}
             return self._generate_tiled(image, ctx, prompt, negative, seed, int(tiles["size"]),
                                         int(tiles["overlap"])), f"comfyui://{ctx.get('stem', 'texture')}"
         return self._generate_one(image, ctx, prompt, negative, seed), f"comfyui://{ctx.get('stem', 'texture')}"
+
+    def _faithful_enough(self, ref: Image.Image, out: Image.Image) -> bool:
+        """Validation de la génération (même seuils que pour la texture finale) sur une image réduite."""
+        from .imaging import Analysis
+        from .validate import evaluate
+        w, h = ref.size
+        an = Analysis(w, h, "none", False, False, 0.1, 0.1, False, "ai", "", "")
+        return bool(evaluate(ref.convert("RGBA"), out.convert("RGBA").resize((w, h), Image.LANCZOS), an,
+                             self.cfg).get("passed"))
+
+    def _probe_denoise(self, image: Image.Image, ctx: dict, prompt: str, negative: str, seed: int,
+                       steps: list[float]) -> float:
+        small = _megapixel(image)
+        for i, d in enumerate(steps):
+            if self.backend.on_progress is not None:
+                self.backend.on_progress(tr("{stem} : essai du denoise {d:.2f}", stem=ctx.get("stem", "texture"), d=d))
+            out = self._generate_one(small, {**ctx, "denoise": round(d, 3), "tiling": "disable",
+                                             "stem": f"{ctx.get('stem', 'texture')}_p{i}"}, prompt, negative, seed,
+                                     tiled=True)
+            if self._faithful_enough(small, out):
+                return round(d, 3)
+        return round(steps[-1], 3)
+
+    def _global_pass(self, image: Image.Image, ctx: dict, prompt: str, negative: str, seed: int,
+                     steps: list[float] | None = None) -> tuple[Image.Image, float]:
+        """Image entière à environ 1 mégapixel, générée au denoise demandé, puis remise à la taille de `image`
+        (Real-ESRGAN si disponible, sinon Lanczos) pour servir de base aux morceaux. Avec plusieurs paliers
+        (denoise automatique), le premier qui passe le garde-fou est gardé. Renvoie (base, denoise retenu)."""
+        W, H = image.size
+        small = _megapixel(image)
+        steps = steps or [float(ctx.get("denoise") or 0.8)]
+        for i, d in enumerate(steps):
+            if self.backend.on_progress is not None:
+                self.backend.on_progress(tr("{stem} : passe globale", stem=ctx.get("stem", "texture"))
+                                         + (f" ({d:.2f})" if len(steps) > 1 else ""))
+            out = self._generate_one(small, {**ctx, "denoise": round(d, 3), "tiling": "disable",
+                                             "stem": f"{ctx.get('stem', 'texture')}_g{i}"}, prompt, negative, seed,
+                                     tiled=True)
+            if len(steps) == 1 or i == len(steps) - 1 or self._faithful_enough(small, out):
+                break
+        from .imaging import _esrgan
+        lc = self.cfg.get("local", {})
+        up = _esrgan(out, lc.get("esrgan_exe", ""), lc.get("esrgan_model", "realesrgan-x4plus"))
+        return (up or out).convert("RGB").resize((W, H), Image.LANCZOS), d
 
     def _generate_tiled(self, image: Image.Image, ctx: dict, prompt: str, negative: str, seed: int,
                         size: int, overlap: int) -> Image.Image:
@@ -636,6 +699,8 @@ class ComfyUIProvider:
                 raise TransientError(tr("[timeout] pas de réponse de la boucle ComfyUI : {exc}", exc=exc)) from exc
         else:
             raise WorkflowFatal(str(last))
+        if self.on_pass is not None:
+            self.on_pass(ctx.get("tid"))
         img = Image.open(io.BytesIO(blobs[0]))
         img.load()
         return img.convert("RGB")
@@ -702,6 +767,26 @@ def substitute_model(field: str, wanted: str, available: list[str], family: str)
 BYPASS = {"SeamlessTile": "model", "MakeCircularVAE": "vae", "ColorTransfer": "image_target", "OffsetImage": "pixels",
           "ZImageFunControlnet": "model"}
 CONTROLNET_APPLY = {"ControlNetApplyAdvanced", "ControlNetApply", "ZImageFunControlnet", "QwenImageDiffsynthControlnet"}
+
+
+def compose_prompt(c: dict, hint: str, material_prompt: str, tiled: bool) -> str:
+    """Prompt d'une texture : préfixe du rendu, indice de la règle, « Prompt à donner », prompt du matériau
+    (rendu Fidèle seulement), suffixe. Avec « prompt seul », le texte de l'utilisateur est envoyé tel quel."""
+    user = " ".join(str(c.get("subject") or "").split())          # retours à la ligne -> espaces
+    if c.get("prompt_only") and user:
+        return ", ".join(x for x in (hint, user) if x)
+    # photoréaliste : pas de prompt de matériau (détection faite pour des textures, trompeuse sur une image)
+    material = "" if str(c.get("style") or "faithful") == "photoreal" else material_prompt
+    body = ", ".join(x for x in (hint, user, material) if x) or "detailed surface"
+    prefix = c.get("prompt_prefix_tiled", "") if tiled else c.get("prompt_prefix", "")
+    return f"{prefix}{body}{c.get('prompt_suffix', '')}"
+
+
+def _megapixel(image: Image.Image, pixels: int = 1024 * 1024) -> Image.Image:
+    """Réduction à environ 1 mégapixel (résolution native des modèles) pour une passe sur l'image entière."""
+    W, H = image.size
+    s = min(1.0, (pixels / (W * H)) ** 0.5)
+    return image.convert("RGB").resize((max(64, round(W * s)), max(64, round(H * s))), Image.LANCZOS)
 
 
 def drop_model_patches(graph: dict) -> dict:

@@ -307,6 +307,8 @@ class Runner:
         if not plan:                     # par morceaux : l'entrée est la version locale, déjà enregistrée
             save_png(model_in, p["prep"])
         context = self.provider.build_context(rec, an) if hasattr(self.provider, "build_context") else None
+        if context is not None:
+            context["tid"] = tid                 # passages ComfyUI rattachés à leur texture (estimation du temps)
         if plan and context is not None:
             context["tiles"] = {"size": plan[0], "overlap": plan[1]}
         extra_kw = {"context": context} if context is not None else {}
@@ -376,8 +378,10 @@ class Runner:
                 self.state.add_request(rid, tid, _a, _s, prep.to_dict())
 
             try:
+                # numéro d'essai transmis : le denoise automatique descend d'un palier à chaque nouvel essai
+                kw = {"context": {**extra_kw["context"], "attempt": attempt}} if "context" in extra_kw else {}
                 out_img, url = self.provider.generate(model_in, self.refs, prompt, negative,
-                                                      prep.aspect_ratio, seed, on_submitted, **extra_kw)
+                                                      prep.aspect_ratio, seed, on_submitted, **kw)
             except ProviderError as exc:
                 if "id" in submitted:
                     self.state.finish_request(submitted["id"], "failed")
